@@ -7,6 +7,12 @@ buttons, and pick up the same session later on your laptop (`claude --resume`).
 It drives the local `claude` CLI as a subprocess, so it inherits your existing
 Claude Code login (no OAuth token juggling). Everything runs on your own machine.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="Telegram chat: start a task, live progress card, tool approval buttons, session picker" width="420">
+</p>
+
+<sub>Illustrative mockup with placeholder content.</sub>
+
 ## Why
 
 The naive `claude -p "<question>"` per Telegram message is stateless: no session
