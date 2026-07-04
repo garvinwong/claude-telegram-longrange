@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.db
+*.sqlite
+# never commit local config / secrets / runtime state
+config.json
+.env
+*.log

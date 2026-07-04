@@ -1,0 +1,10 @@
+{
+  "bot_token": "123456:PUT-YOUR-TELEGRAM-BOT-TOKEN-HERE",
+  "chat_id": "123456789",
+  "allowed_user_ids": "123456789",
+  "workdir": "/home/you/your-project",
+  "allowed_models": ["opus", "sonnet", "haiku"],
+  "max_concurrency": 2,
+  "task_timeout": 7200,
+  "progress_throttle": 20
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Telegram Longrange Session Daemon
+After=network.target
+
+[Service]
+Type=simple
+# @@WORKDIR@@ / @@SRC@@ are substituted by install.sh at install time
+WorkingDirectory=@@WORKDIR@@
+Environment=TGLR_WORKDIR=@@WORKDIR@@
+ExecStart=/usr/bin/python3 @@SRC@@/daemon.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/tmp/claude-telegram-longrange.log
+StandardError=append:/tmp/claude-telegram-longrange.log
+
+[Install]
+WantedBy=default.target
