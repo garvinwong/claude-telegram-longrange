@@ -29,6 +29,11 @@ progress, no session management. This daemon fixes all four:
   final answer is posted as its own message.
 - **Session management** — `/new`, `/resume`, `/sessions`, `/attach`, `/say`,
   `/cancel`, paginated inline-keyboard pickers, per-task model selection.
+- **Conversational by default** — plain text continues your *current* session
+  (memory intact); `/new` opens a fresh one. A single "current session" pointer
+  (persisted across restarts) keeps every entry point — plain text, `/resume`,
+  `/sessions`, `/say`, replying to a card — pointing at the same session, so
+  replies never cross wires.
 
 ## Requirements
 
@@ -75,7 +80,7 @@ are checked before any routing.
 | `/tasks` | List recent tasks |
 | `/cancel <n>` | Kill a task's process group |
 | `/help` | Usage |
-| *(plain text, no slash)* | One-shot Q&A (stateless) |
+| *(plain text, no slash)* | **Continue the current session** — conversational, with memory (`/new` for a fresh one) |
 
 ## Approvals (the interesting part)
 
@@ -86,6 +91,18 @@ daemon's relay thread polls the bridge, pushes an inline keyboard to Telegram,
 and writes the decision back. A desktop popup and the phone buttons coexist —
 **whichever responds first wins**. The relay only pushes approvals for sessions
 tracked in its ledger, so your unrelated local dev sessions never buzz your phone.
+
+Two refinements worth calling out:
+
+- **`AskUserQuestion` becomes a real poll** — a single-select question renders
+  its options as one button each; tapping one sends *that choice* back to the
+  model, instead of a bare allow/deny on raw JSON.
+- **No stale-card floods** — a single failed bridge poll is treated as a blip
+  (the relay stays on the authoritative bridge path); only after several
+  consecutive misses does it fall back to reading the queue file, and even then
+  it surfaces only approvals still inside the hook's wait window. So a decision
+  you already made on the desktop can't resurface as a pile of "expired" cards
+  on your phone.
 
 If you don't run the agents-island bridge, the session/progress features work
 fine; only the Telegram approval relay is inert.

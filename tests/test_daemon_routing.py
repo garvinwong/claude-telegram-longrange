@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# test_daemon_routing.py — 该阶段 路由层单测（pytest）
+# test_daemon_routing.py — 路由层单测（pytest）
 #
 # 约束（红线）：TG API 全 mock（FakeApi），runner.start/resume/cancel 用 monkeypatch 假桩，
 #   短问答 ask_claude 也 mock——绝不真实网络、绝不起真 claude、绝不投运。DB 全用 tmp_path。
 #   单测内 sleep 上限 2s；worker 线程用事件/短轮询等待。
 #
-# 运行：python3 -m pytest tests/test_daemon_routing.py -v
+# 运行：python3 -m pytest apps/tg-longrange/tests/test_daemon_routing.py -v
 
 import os
 import sys
@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-# 无包结构，把 src 挂上 sys.path
+# 无包结构，把 apps/tg-longrange 挂上 sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config   # noqa: E402
@@ -148,9 +148,9 @@ def bundle(tmp_path, monkeypatch):
 
     # 路由测试默认用无害进度卡（见 _NoopCard）；需验证真实进度卡集成的用例自行还原
     monkeypatch.setattr(progress, "ProgressCard", _NoopCard)
-    # 隔离默认模型/offset 文件到 tmp，绝不污染真实状态目录
+    # 隔离默认模型/offset 文件到 tmp，绝不污染真实状态目录（含线上 daemon）
     monkeypatch.setattr(config, "OFFSET_FILE", str(tmp_path / "offset"))
-    # 白名单来自 env/config（测试环境为空）→ 显式置入测试 UID，否则消息全被拦
+    # config 的白名单来自环境变量，测试环境为空——注入占位白名单，等价线上鉴权
     monkeypatch.setattr(config, "ALLOWED_USER_IDS", {WHITELIST_UID})
 
     dae = daemon.Daemon(api, store, config)
@@ -200,12 +200,11 @@ def test_group_chat_dropped(bundle):
     assert bundle.qa_calls == []
 
 
-
-# ── ④ /new 创建任务入队并最终调 runner.start ──────────────────────────────
+# ── ③ /new 创建任务入队并最终调 runner.start ──────────────────────────────
 def test_new_enqueues_and_runs(bundle):
-    bundle.d.handle_update(msg_update(text="/new 写一份清算周报"))
+    bundle.d.handle_update(msg_update(text="/new 写一份周报"))
     assert wait_for(lambda: len(bundle.rcalls["start"]) == 1), "runner.start 未被调用"
-    assert bundle.rcalls["start"][0]["prompt"] == "写一份清算周报"
+    assert bundle.rcalls["start"][0]["prompt"] == "写一份周报"
     # 任务落终态 done；sid 由 daemon 受理时预生成（uuid），并原样传给 runner.start
     assert wait_for(lambda: bundle.store.get(1)["status"] == tasks.STATUS_DONE)
     sid = bundle.store.get(1)["session_id"]
@@ -334,12 +333,11 @@ def test_sessions_button_pick_attaches(bundle, tmp_path, monkeypatch):
     bundle.d.handle_update(cq)
     row = bundle.store.get_by_session(uuid_a)
     assert row is not None and row["origin"] == "attach"
-    # 发了锚点消息且其 message_id 落为 progress_msg_id（回复即续话）
-    assert row["progress_msg_id"] is not None
-    assert bundle.api.answered[-1][1] == "已接管"
-    # 回复该锚点消息 → 路由到 resume 该任务
-    bundle.d.handle_update(msg_update(text="继续写完",
-                                      reply_to=row["progress_msg_id"]))
+    # 接管即「切为当前会话」；toast 提示已切
+    assert bundle.d._current[str(WHITELIST_UID)] == row["task_id"]
+    assert bundle.api.answered[-1][1] == "已切到该会话"
+    # 此后直接发普通文本 → 接着该会话 resume（无需回复任何消息）
+    bundle.d.handle_update(msg_update(text="继续写完"))
     assert wait_for(lambda: len(bundle.rcalls["resume"]) == 1)
     assert bundle.rcalls["resume"][0]["session_id"] == uuid_a
 
@@ -367,13 +365,16 @@ def test_resume_panel_lists_resumable_tasks(bundle):
     cbs = [row[0]["callback_data"] for row in kb]
     assert f"tsel:{r_id}" in cbs          # 可续任务在面板
     assert not any(c.endswith("run-sid") for c in cbs)  # 运行中的不列（无 tsel）
-    # 点选 → 发锚点、回复即续话
+    # 点选 → 切为当前会话，此后普通文本接着它聊
     cq = {"callback_query": {"id": "cb2", "from": {"id": WHITELIST_UID},
                              "message": {"chat": {"id": WHITELIST_UID}},
                              "data": f"tsel:{r_id}"}}
     bundle.d.handle_update(cq)
-    assert bundle.store.get(r_id)["progress_msg_id"] is not None
-    assert bundle.api.answered[-1][1] == "回复确认消息即可续话"
+    assert bundle.d._current[str(WHITELIST_UID)] == r_id
+    assert bundle.api.answered[-1][1] == "已切到该会话"
+    bundle.d.handle_update(msg_update(text="接着说"))
+    assert wait_for(lambda: len(bundle.rcalls["resume"]) == 1)
+    assert bundle.rcalls["resume"][0]["session_id"] == "rs-sid"
 
 
 def test_bot_commands_menu_valid_and_covers_router():
@@ -435,8 +436,8 @@ def test_model_persists_across_reload(bundle, tmp_path):
 def test_rename_updates_title(bundle):
     tid = bundle.store.create(session_id="rn-sid", title="自动截取的长描述",
                               status=tasks.STATUS_DONE, chat_id=str(WHITELIST_UID))
-    bundle.d.handle_update(msg_update(text=f"/rename {tid} 清算周报"))
-    assert bundle.store.get(tid)["title"] == "清算周报"
+    bundle.d.handle_update(msg_update(text=f"/rename {tid} 周报"))
+    assert bundle.store.get(tid)["title"] == "周报"
     # 格式错误 → 提示用法，不改
     bundle.d.handle_update(msg_update(text="/rename abc x", update_id=2))
     assert "用法" in bundle.api.last_text()
@@ -478,22 +479,20 @@ def test_new_adds_eyes_reaction(bundle):
     assert any(r[2] == "👀" and r[1] == 10 for r in bundle.api.reactions)
 
 
-def test_pick_session_collapses_panel_and_forcereply(bundle, tmp_path, monkeypatch):
+def test_pick_session_collapses_panel_and_switches_current(bundle, tmp_path, monkeypatch):
     sdir = tmp_path / "projects"
     sdir.mkdir()
     uuid_a = "cccc9999-1111-2222-3333-444444444444"
     _write_session(str(sdir), uuid_a, "点我接管", time.time())
     monkeypatch.setattr(config, "SESSIONS_PROJECT_DIR", str(sdir))
-    # 带 message_id 的面板点击 → 面板消息被就地改写（撤按钮）
+    # 带 message_id 的面板点击 → 面板消息被就地改写（撤按钮）+ 切为当前会话
     cq = {"callback_query": {"id": "c", "from": {"id": WHITELIST_UID},
                              "message": {"chat": {"id": WHITELIST_UID}, "message_id": 888},
                              "data": f"sess:{uuid_a}"}}
     bundle.d.handle_update(cq)
-    assert any(e["message_id"] == 888 and "已接管" in e["text"] for e in bundle.api.edited)
-    # 锚点消息用 ForceReply（客户端自动弹回复框）
-    anchor = bundle.api.sent[-1]
-    assert anchor["reply_markup"].get("force_reply") is True
-    assert "续话给任务" in anchor["reply_markup"].get("input_field_placeholder", "")
+    assert any(e["message_id"] == 888 and "已切到会话" in e["text"] for e in bundle.api.edited)
+    row = bundle.store.get_by_session(uuid_a)
+    assert bundle.d._current[str(WHITELIST_UID)] == row["task_id"]
 
 
 def test_pick_model_collapses_panel(bundle):
@@ -503,6 +502,42 @@ def test_pick_model_collapses_panel(bundle):
     bundle.d.handle_update(cq)
     assert bundle.d._default_model == "sonnet"
     assert any(e["message_id"] == 999 and "sonnet" in e["text"] for e in bundle.api.edited)
+
+
+def test_plain_text_starts_then_continues_conversation(bundle):
+    # 首条普通文本 → 新建对话会话(origin=chat)并 start；设为当前会话
+    bundle.d.handle_update(msg_update(text="帮我看看 crowdsec 配置", update_id=1))
+    assert wait_for(lambda: bundle.store.get(1) and bundle.store.get(1)["status"] == tasks.STATUS_DONE)
+    t1 = bundle.store.get(1)
+    assert t1["origin"] == "chat"
+    assert bundle.d._current[str(WHITELIST_UID)] == 1
+    # 收到消息即加 👀（处理中信号）
+    assert any(r[2] == "👀" for r in bundle.api.reactions)
+    # 第二条普通文本 → 接着同一会话 resume（有记忆），不新建
+    sid = t1["session_id"]
+    bundle.d.handle_update(msg_update(text="那第二点呢", update_id=2))
+    assert wait_for(lambda: len(bundle.rcalls["resume"]) == 1)
+    assert bundle.rcalls["resume"][0]["session_id"] == sid
+    assert len(bundle.rcalls["start"]) == 1   # 未再新建
+
+
+def test_new_opens_fresh_then_plain_continues_it(bundle):
+    bundle.d.handle_update(msg_update(text="/new 重构支付重试", update_id=1))
+    assert wait_for(lambda: bundle.store.get(1)["status"] == tasks.STATUS_DONE)
+    sid = bundle.store.get(1)["session_id"]
+    assert bundle.d._current[str(WHITELIST_UID)] == 1
+    bundle.d.handle_update(msg_update(text="加上单元测试", update_id=2))
+    assert wait_for(lambda: len(bundle.rcalls["resume"]) == 1)
+    assert bundle.rcalls["resume"][0]["session_id"] == sid
+
+
+def test_converse_while_running_asks_to_wait(bundle):
+    tid = bundle.store.create(session_id="run-sid", title="在跑",
+                              status=tasks.STATUS_RUNNING, chat_id=str(WHITELIST_UID))
+    bundle.d._current[str(WHITELIST_UID)] = tid
+    bundle.d.handle_update(msg_update(text="再补一句"))
+    assert "还在处理" in bundle.api.last_text()
+    assert bundle.rcalls["resume"] == [] and bundle.rcalls["start"] == []
 
 
 def test_picker_callback_non_whitelist_rejected(bundle):

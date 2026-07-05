@@ -18,21 +18,49 @@
 
 import json
 import os
+import sys
 import threading
 import time
 
-# callback_data 前缀——短前缀省字节，避开 TG 64 字节上限（ccgram 实践教训，oss-radar 已录）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config   # noqa: E402 — 用其 md_to_html（HTML 转义）与降级参数常量
+
+# callback_data 前缀——短前缀省字节，避开 Telegram 64 字节 callback_data 上限
 _CB_PREFIX = "tglr"
 _ACTIONS = ("allow", "deny", "always")
+
+# 降级 pending 最大存活（秒）——超此年龄的队列条目视为 hook 早已 defer 的历史积压，
+# 绝不当新审批推送。取 config.DEGRADED_PENDING_MAX_AGE，缺省 660（600+宽限）。
+_DEGRADED_MAX_AGE = getattr(config, "DEGRADED_PENDING_MAX_AGE", 660)
+_DEGRADE_AFTER = getattr(config, "BRIDGE_DEGRADE_AFTER", 3)
+
+
+def perm_id_ts(perm_id):
+    """从 perm_id（hook 生成的 <sha12>_<unix_ts>）取末段 unix 时间戳。
+
+    取不到（无下划线 / 末段非纯数字）返回 None——保守不参与 TTL 过滤（放行），
+    因真实 hook id 必带时间戳，无时间戳者只可能是测试/异常数据，不做误杀。
+    """
+    if not perm_id or "_" not in str(perm_id):
+        return None
+    tail = str(perm_id).rsplit("_", 1)[1]
+    return int(tail) if tail.isdigit() else None
 
 # 桥决策枚举（POST /api/decision 接受 allow|deny|always；hook 只认 allow|deny，
 # 桥把 always 翻成 allow 响应 + 写 always 标志——降级路径同此语义）
 _BRIDGE_URL_DEFAULT = "http://127.0.0.1:5599"
 
 
+def _valid_action(a):
+    # 合法动作：三档审批 allow/deny/always，或选择题选项 opt<N>（N 为选项序号）
+    return a in _ACTIONS or (a.startswith("opt") and a[3:].isdigit())
+
+
 def build_callback_data(perm_id, action):
     # 结构：tglr:<perm_id>:<action>。perm_id 为 sha256前12 + '_' + 秒级时间戳 ≈ 23 字节，
     # 全长 ≈ 36 字节，稳在 64 以内（构造处即断言，防未来 perm_id 变长踩坑）
+    if not _valid_action(action):
+        raise ValueError(f"非法 action: {action}")
     data = f"{_CB_PREFIX}:{perm_id}:{action}"
     if len(data.encode("utf-8")) >= 64:
         # 结构性防呆：宁可拒发也不发一个会被 TG 截断的 callback_data
@@ -45,9 +73,44 @@ def parse_callback_data(data):
     if not data or not data.startswith(_CB_PREFIX + ":"):
         return None
     parts = data.split(":")
-    if len(parts) != 3 or parts[2] not in _ACTIONS:
+    if len(parts) != 3 or not _valid_action(parts[2]):
         return None
     return parts[1], parts[2]
+
+
+def _short(s, n):
+    s = "" if s is None else str(s)
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def parse_ask(entry):
+    """AskUserQuestion 单问题单选 → 结构化选项；否则 None（多问题/多选回落普通审批）。
+
+    与 agents-island 面板 askPayload 同口径：只有 questions 恰好 1 条、非 multiSelect、
+    且有选项时才走"选择题"渲染；其余（多问题、多选、无选项）回落三档审批卡。
+    """
+    if entry.get("tool_name") != "AskUserQuestion":
+        return None
+    qs = (entry.get("tool_input") or {}).get("questions")
+    if not isinstance(qs, list) or len(qs) != 1:
+        return None
+    q = qs[0] if isinstance(qs[0], dict) else {}
+    if q.get("multiSelect"):
+        return None
+    opts = q.get("options")
+    if not isinstance(opts, list) or not opts:
+        return None
+    labels, descs = [], []
+    for o in opts[:6]:            # TG 键盘最多列 6 项（与岛一致），罕见超额截断
+        if isinstance(o, dict):
+            labels.append(str(o.get("label", "")))
+            descs.append(str(o.get("description", "")))
+        else:
+            labels.append(str(o))
+            descs.append("")
+    return {"question": str(q.get("question", "")),
+            "header": str(q.get("header", "")),
+            "labels": labels, "descs": descs}
 
 
 class BridgeClient:
@@ -89,14 +152,25 @@ class FileChannel:
     轮询，非原子写会暴露空文件窗口，hook 读到半截 JSON 会兜底 allow（把 deny 反转）。
     """
 
-    def __init__(self, state_dir):
+    def __init__(self, state_dir, now_epoch_fn=time.time):
         self.state_dir = state_dir
         self.queue_file = os.path.join(state_dir, "queue.jsonl")
         self.resp_dir = os.path.join(state_dir, "responses")
+        self.now_epoch_fn = now_epoch_fn   # 注入 wall-clock（测 TTL 用；perm_id 时间戳是 epoch）
 
-    def read_pending(self):
-        # 降级读 pending：队列内出现、但尚无响应文件、且未过期的条目视为待审批。
-        # 这是近似（无桥的 TTL/always 逻辑），仅作桥宕期间的应急，桥恢复即回主路径。
+    def read_pending(self, now_epoch=None, max_age=None):
+        # 降级读 pending：队列内出现、尚无响应文件、且「年龄在窗口内」的条目视为待审批。
+        #
+        # ⚠️ 关键护栏（修复历史积压回涌）：hook 消费响应后会 rm 掉响应文件
+        # （pre_tool_use.sh），queue.jsonl 又只留最近 200 行——因此"无响应文件"并不
+        # 代表"仍待审批"，历史已决条目会因响应文件被删而重新显得 pending。若不加时间
+        # 窗口，桥一抖动降级就会把整段历史审批当新卡刷屏（典型故障现象）。
+        # 故按 perm_id 内嵌的 unix 时间戳过滤：年龄 > max_age 者，hook 早已 defer/超时，
+        # 绝非活跃待审批，一律不推。这是无桥期对桥端 PENDING_TTL 的等价近似。
+        if now_epoch is None:
+            now_epoch = self.now_epoch_fn()
+        if max_age is None:
+            max_age = _DEGRADED_MAX_AGE
         if not os.path.exists(self.queue_file):
             return []
         entries = {}
@@ -121,6 +195,9 @@ class FileChannel:
                 continue
             if os.path.exists(os.path.join(self.resp_dir, f"{eid}.json")):
                 continue   # 已有响应 = 已处理
+            ts = perm_id_ts(eid)
+            if ts is not None and (now_epoch - ts) > max_age:
+                continue   # 超窗口的历史积压：hook 早已 defer，绝不回涌为新卡
             pending.append(e)
         return pending
 
@@ -180,6 +257,9 @@ class ApprovalRelay:
         self._inflight = {}
         self._stop = threading.Event()
         self._thread = None
+        # 抗抖动：连续桥不可达计数；达 _degrade_after 才切文件降级（防单次抖动误降级刷屏）
+        self._miss = 0
+        self._degrade_after = getattr(cfg, "BRIDGE_DEGRADE_AFTER", _DEGRADE_AFTER)
 
     # ── 线程生命周期 ─────────────────────────────────────────────────────
     def start(self):
@@ -205,10 +285,16 @@ class ApprovalRelay:
     def poll_once(self):
         state = self.bridge.get_state()
         if state is not None:
+            self._miss = 0                        # 桥可达：重置抖动计数
             pending = state.get("pending") or []
             degraded = False
         else:
-            pending = self.files.read_pending()   # 降级
+            self._miss += 1
+            # 抖动缓冲：连续 miss 未达阈值 → 本轮什么都不做（既不推卡也不改写），
+            # 保持在权威桥路径。桥端 PENDING_TTL 会正确处理已决/过期，无需文件降级介入。
+            if self._miss < self._degrade_after:
+                return
+            pending = self.files.read_pending()   # 持续不可达才降级（TTL 护栏在内）
             degraded = True
 
         active = self.store.active_session_ids()
@@ -236,7 +322,7 @@ class ApprovalRelay:
 
     def _push_card(self, entry, degraded):
         text = self._render_card(entry, degraded)
-        keyboard = self._keyboard(entry.get("id"))
+        keyboard = self._keyboard(entry)
         chat_id = getattr(self.cfg, "CHAT_ID", None)
         mid = self.api.send_message(chat_id, text, reply_markup=keyboard)
         with self._lock:
@@ -252,7 +338,7 @@ class ApprovalRelay:
             rec["answered"] = True
             mid, chat_id = rec["message_id"], rec["chat_id"]
         if mid is not None:
-            self.api.edit_message(chat_id, mid, "☑️ 已在本机agents-island处理")
+            self.api.edit_message(chat_id, mid, "☑️ 已在电脑端处理（或已超时）")
 
     # ── callback_query 处理（Owner 点按钮）───────────────────────────────
     def handle_callback(self, cq):
@@ -276,10 +362,16 @@ class ApprovalRelay:
             self.api.answer_callback_query(cq_id, text="该审批已过期或已处理")
             return True
 
-        ok = self._commit_decision(perm_id, action, rec["entry"])
+        entry = rec["entry"]
+        # 选择题作答（opt<N>）与三档审批分流
+        if action.startswith("opt"):
+            answered = self._answer_option(cq_id, perm_id, action, entry, rec)
+            return answered
+
+        ok = self._commit_decision(perm_id, action, entry)
         with self._lock:
             rec["answered"] = True
-            mid, chat_id, entry = rec["message_id"], rec["chat_id"], rec["entry"]
+            mid, chat_id = rec["message_id"], rec["chat_id"]
 
         label = {"allow": "✅ 已批准", "deny": "❌ 已拒绝",
                  "always": "⚡ 本任务后续全批"}[action]
@@ -293,9 +385,32 @@ class ApprovalRelay:
             self.api.edit_message(chat_id, mid, f"{label} · {tool}")
         return True
 
-    def _commit_decision(self, perm_id, action, entry):
-        # 优先经桥 POST /api/decision；桥不可达（None）→ 降级直写响应文件
-        reason = "User denied via Telegram" if action == "deny" else ""
+    def _answer_option(self, cq_id, perm_id, action, entry, rec):
+        # 选择题作答：把选项回传给模型。协议与 agents-island 一致——decision=deny + reason 携带
+        # 用户所选（模型读 reason 即视为"用户已答此选项，据此继续，勿再问"）。
+        ask = parse_ask(entry)
+        idx = int(action[3:]) if action[3:].isdigit() else -1
+        if not ask or not (0 <= idx < len(ask["labels"])):
+            self.api.answer_callback_query(cq_id, text="该选项已失效")
+            return True
+        label = ask["labels"][idx]
+        reason = (f"[用户已在 Telegram 作答] 问题：「{ask['question'][:120]}」 "
+                  f"答案：选择「{label}」。请按此答案继续，勿再追问。")
+        ok = self._commit_decision(perm_id, "deny", entry, reason=reason)
+        with self._lock:
+            rec["answered"] = True
+            mid, chat_id = rec["message_id"], rec["chat_id"]
+        toast = f"已作答：{_short(label, 40)}" if ok else "⚠️ 处理失败或已被处理"
+        self.api.answer_callback_query(cq_id, text=toast)
+        if mid is not None:
+            self.api.edit_message(chat_id, mid, f"🗳️ 已作答：{label}")
+        return True
+
+    def _commit_decision(self, perm_id, action, entry, reason=None):
+        # 优先经桥 POST /api/decision；桥不可达（None）→ 降级直写响应文件。
+        # reason=None 时按动作取默认（deny→标准拒绝语）；选择题作答传入自定义 reason。
+        if reason is None:
+            reason = "User denied via Telegram" if action == "deny" else ""
         result = self.bridge.post_decision(perm_id, action, reason)
         if result is True:
             return True
@@ -307,7 +422,17 @@ class ApprovalRelay:
             agent_source=entry.get("agent_source", "claude"))
 
     # ── 渲染 ─────────────────────────────────────────────────────────────
-    def _keyboard(self, perm_id):
+    def _keyboard(self, entry):
+        perm_id = entry.get("id")
+        ask = parse_ask(entry)
+        if ask:
+            # 选择题：一选项一按钮（序号前缀对齐卡片正文），末行留"终端作答"给自由输入
+            rows = [[{"text": f"{i + 1}. {_short(label, 24)}",
+                      "callback_data": build_callback_data(perm_id, f"opt{i}")}]
+                    for i, label in enumerate(ask["labels"])]
+            rows.append([{"text": "✏️ 其他（回终端作答）",
+                          "callback_data": build_callback_data(perm_id, "allow")}])
+            return {"inline_keyboard": rows}
         return {"inline_keyboard": [[
             {"text": "✅ 批准", "callback_data": build_callback_data(perm_id, "allow")},
             {"text": "❌ 拒绝", "callback_data": build_callback_data(perm_id, "deny")},
@@ -316,6 +441,22 @@ class ApprovalRelay:
 
     @staticmethod
     def _render_card(entry, degraded):
+        title = entry.get("title") or entry.get("session_slug") or ""
+        deg = "（桥降级模式）" if degraded else ""
+        ask = parse_ask(entry)
+        if ask:
+            # 选择题卡：题干 + 逐条"序号. 选项 — 说明"，让手机端看清每项含义再点按钮
+            lines = [f"🗳️ 选择题{deg}", f"任务: {title}"]
+            if ask["header"]:
+                lines.append(f"【{ask['header']}】")
+            if ask["question"]:
+                lines.append(ask["question"])
+            for i, (label, desc) in enumerate(zip(ask["labels"], ask["descs"])):
+                line = f"{i + 1}. {label}"
+                if desc:
+                    line += f" — {desc}"
+                lines.append(_short(line, 300))
+            return config.md_to_html("\n".join(lines))   # 转义/加粗，防 < & 破坏 HTML 解析
         tool = entry.get("tool_name", "?")
         tinput = entry.get("tool_input") or {}
         # 命令摘要：Bash 展示 command，其余展示紧凑 JSON，均截断防盲批时刷屏（S2③）
@@ -323,6 +464,5 @@ class ApprovalRelay:
             summary = str(tinput.get("command", ""))[:300]
         else:
             summary = json.dumps(tinput, ensure_ascii=False)[:300]
-        title = entry.get("title") or entry.get("session_slug") or ""
-        head = "🔐 工具审批请求" + ("（桥降级模式）" if degraded else "")
-        return f"{head}\n任务: {title}\n工具: {tool}\n{summary}"
+        head = "🔐 工具审批请求" + deg
+        return config.md_to_html(f"{head}\n任务: {title}\n工具: {tool}\n{summary}")

@@ -240,6 +240,11 @@ class Daemon:
         self._default_model_file = os.path.join(
             os.path.dirname(cfg.OFFSET_FILE), "default_model")
         self._default_model = self._load_default_model()
+        # 每个 chat 的「当前会话」指针（默认连续对话：普通文本接着它聊）。持久化跨重启。
+        self._current_file = os.path.join(
+            os.path.dirname(cfg.OFFSET_FILE), "current_sessions.json")
+        self._current = self._load_current()   # {chat_id(str): task_id(int)}
+        self._current_lock = threading.Lock()
         # 审批中继：daemon 内线程，构造即备好，run() 时 start()。
         # 延迟导入避免纯路由测试硬依赖；缺失时降级为无中继（callback 只静默 answer）。
         self._relay = None
@@ -309,7 +314,7 @@ class Daemon:
             title = item.get("title") or ""
             model = item.get("model")
 
-            # 进度卡：该阶段 提供 progress.py，本批 lazy import，缺失降级为仅日志。
+            # 进度卡：由 progress.py 提供，本批 lazy import，缺失降级为仅日志。
             # 契约：ProgressCard(send_fn, edit_fn, chat_id, task_id, title, session_id,
             #   model=None, throttle_s=20)；.message_id 属性 = 进度卡 message_id；
             #   handle_event(event) / finish(status, note=None)。
@@ -401,7 +406,7 @@ class Daemon:
     # ── 主路由入口（测试主入口）───────────────────────────────────────────
     def handle_update(self, update):
         """单条 update 的完整路由。顺序铁律见各分支注释。"""
-        # 回调查询（审批按钮）：本批只建 from.id 校验骨架，relay 由该阶段 接管
+        # 回调查询（审批按钮）：本批只建 from.id 校验骨架，relay 由审批中继接管
         if "callback_query" in update:
             self._handle_callback(update["callback_query"])
             return
@@ -410,7 +415,7 @@ class Daemon:
         if not msg:
             return
 
-        # 白名单（S1）：from.id 不在白名单 → 静默丢弃记日志
+        # ① 白名单（S1）：from.id 不在白名单 → 静默丢弃记日志
         frm = msg.get("from") or {}
         uid = frm.get("id")
         if uid not in self.cfg.ALLOWED_USER_IDS:
@@ -422,7 +427,7 @@ class Daemon:
             return
         chat_id = str(chat.get("id"))
 
-        # ③ 图片消息 → v1 视觉问答路径（走短问答）
+        # ② 图片消息 → 视觉问答路径（走短问答）
         if msg.get("photo"):
             self._handle_photo(msg, chat_id)
             return
@@ -431,7 +436,7 @@ class Daemon:
         if not text:
             return
 
-        # ④ 对进度卡的回复 → 等价 /say 该任务
+        # ③ 对进度卡的回复 → 等价 /say 该任务
         reply = msg.get("reply_to_message")
         if reply:
             task = self._task_by_progress_msg(reply.get("message_id"))
@@ -439,11 +444,11 @@ class Daemon:
                 self._say(chat_id, task, text)
                 return
 
-        # ⑤ 命令路由 / 短问答
+        # ④ 命令路由 / 连续对话（普通文本 = 接着当前会话聊，有记忆+审批+进度）
         if text.startswith("/"):
             self._route_command(chat_id, text, msg_id=msg.get("message_id"))
         else:
-            self._short_qa(chat_id, text)
+            self._converse(chat_id, text, msg_id=msg.get("message_id"))
 
     # ── callback_query → 面板选择（sess/tsel）或审批中继（tglr）──────────────
     def _handle_callback(self, cq):
@@ -495,19 +500,20 @@ class Daemon:
             self.api.edit_message(chat_id, mid, text)
 
     def _cb_pick_session(self, chat_id, full, cq_id, mid=None):
-        # 面板点选会话：完整 uuid 直达（无前缀歧义），接管并发锚点消息
+        # 面板点选会话：接管并「切为当前会话」——此后普通文本直接接着它聊
         if full not in self._all_session_stems():
             self.api.answer_callback_query(cq_id, text="会话已不存在")
             self._collapse_panel(chat_id, mid, "⚠️ 该会话已不存在。")
             return
-        task_id = self._attach_and_anchor(chat_id, full)
+        task_id = self._attach_session(chat_id, full)
         if task_id:
-            self._collapse_panel(chat_id, mid, f"✅ 已接管为任务 #{task_id}。")
+            self._collapse_panel(
+                chat_id, mid, f"✅ 已切到会话 #{task_id}，直接发消息即可续话。")
         self.api.answer_callback_query(
-            cq_id, text=("已接管" if task_id else "该会话已有活跃任务"))
+            cq_id, text=("已切到该会话" if task_id else "该会话已有活跃任务"))
 
     def _cb_pick_task(self, chat_id, tid_str, cq_id, mid=None):
-        # 面板点选台账任务：发锚点消息，回复即续话
+        # 面板点选台账任务：切为当前会话，此后普通文本直接接着它聊（不再靠回复锚点）
         if not tid_str.isdigit():
             self.api.answer_callback_query(cq_id, text="无效任务")
             return
@@ -515,15 +521,13 @@ class Daemon:
         if not task or not task["session_id"]:
             self.api.answer_callback_query(cq_id, text="任务不存在或无会话")
             return
-        if task["status"] == tasks.STATUS_RUNNING:
-            self.api.answer_callback_query(cq_id, text="任务运行中，无需续接")
-            return
-        self._collapse_panel(chat_id, mid, f"✅ 已选任务 #{task['task_id']}。")
-        self._anchor_message(chat_id, task["task_id"],
-                             task["title"] or "", task["session_id"])
-        self.api.answer_callback_query(cq_id, text="回复确认消息即可续话")
+        self._set_current(chat_id, task["task_id"])
+        self._collapse_panel(
+            chat_id, mid,
+            f"✅ 已切到会话 #{task['task_id']}：{task['title'] or ''}\n直接发消息即可续话。")
+        self.api.answer_callback_query(cq_id, text="已切到该会话")
 
-    # ── 图片消息（视觉问答）─────────────────────────────────────────────────
+    # ── 图片消息（视觉问答）────────────────────────────────────────────────
     def _handle_photo(self, msg, chat_id):
         self.api.send_chat_action(chat_id)
         photos = msg.get("photo") or []
@@ -550,9 +554,56 @@ class Daemon:
 
     # ── 短问答（无命令前缀文本）──────────────────────────────────────────────
     def _short_qa(self, chat_id, text):
+        # 仅图片视觉问答仍走此一次性路径；文本已改走 _converse（连续对话）
         self.api.send_chat_action(chat_id)
         reply = ask_claude(text, cwd=self.cfg.WORKDIR)
-        self._send(chat_id, reply)
+        self._send(chat_id, config.md_to_html(reply))
+
+    # ── 当前会话指针（连续对话）────────────────────────────────────────────
+    def _load_current(self):
+        try:
+            with open(self._current_file, encoding="utf-8") as f:
+                return {str(k): int(v) for k, v in json.load(f).items()}
+        except (OSError, ValueError):
+            return {}
+
+    def _set_current(self, chat_id, task_id):
+        with self._current_lock:
+            self._current[str(chat_id)] = task_id
+            try:
+                os.makedirs(os.path.dirname(self._current_file), exist_ok=True)
+                with open(self._current_file, "w", encoding="utf-8") as f:
+                    json.dump(self._current, f)
+            except OSError as e:
+                log.warning("当前会话指针持久化失败: %s", config.redact(repr(e)))
+
+    def _converse(self, chat_id, text, msg_id=None):
+        # 默认连续对话：普通文本接着「当前会话」聊（有记忆）。无则新建；running 则请稍候。
+        if msg_id is not None:
+            self.api.set_message_reaction(chat_id, msg_id, "👀")
+        self.api.send_chat_action(chat_id)
+        tid = self._current.get(str(chat_id))
+        task = self.store.get(tid) if tid else None
+        if task and task["status"] == tasks.STATUS_RUNNING:
+            self._send(chat_id, "⏳ 还在处理上一条，完成后再发（或 /new 开新对话）。")
+            return
+        if task and task["session_id"]:
+            # 接着聊：resume 当前会话（安静入队，进度卡会显示处理态，不再刷"已受理"）
+            self.store.update_status(task["task_id"], tasks.STATUS_QUEUED,
+                                     last_event="连续对话续话")
+            self._enqueue({"kind": "resume", "task_id": task["task_id"],
+                           "chat_id": chat_id, "prompt": text,
+                           "model": task["model"], "title": task["title"],
+                           "session_id": task["session_id"]})
+            return
+        # 无当前会话 → 新建一个对话会话（origin=chat），此后普通文本都接着它聊
+        sid = str(uuid.uuid4())
+        new_id = self.store.create(session_id=sid, title=text[:60], model=self._default_model,
+                                   origin="chat", status=tasks.STATUS_QUEUED, chat_id=chat_id)
+        self._set_current(chat_id, new_id)
+        self._enqueue({"kind": "new", "task_id": new_id, "chat_id": chat_id,
+                       "prompt": text, "model": self._default_model,
+                       "title": text[:60], "session_id": sid})
 
     # ── 命令路由 ────────────────────────────────────────────────────────────
     def _route_command(self, chat_id, text, msg_id=None):
@@ -585,21 +636,21 @@ class Daemon:
     def _help_text():
         return (
             "🤖 <b>长程会话（tg-longrange）用法</b>\n\n"
-            "<b>起任务</b>\n"
-            "· /new &lt;描述&gt; — 起长程任务（可多轮接力、需审批的工具会弹按钮）\n"
-            "· /new -m opus|sonnet|haiku &lt;描述&gt; — 指定模型\n"
-            "· 直接发文字（无 /）— 即时问答（旧行为，单轮）\n\n"
-            "<b>管理会话</b>\n"
+            "<b>直接聊</b>\n"
+            "· 直接发文字（无需 /）— 接着<b>当前会话</b>连续对话，有记忆、需审批的工具会弹按钮\n"
+            "· /new &lt;描述&gt; — 开一个<b>全新</b>会话（清空上下文重开）\n"
+            "· /new -m opus|sonnet|haiku &lt;描述&gt; — 新会话并指定模型\n\n"
+            "<b>切换/管理会话</b>（“当前会话”只有一个，切了就直接聊）\n"
+            "· /resume — <b>弹面板</b>选一个任务<b>切为当前会话</b>，之后直接发消息续话\n"
+            "· /sessions — <b>弹面板</b>选电脑上开的会话切为当前（免手打长 ID）\n"
             "· /tasks — 列最近任务（编号/状态/短 sid）\n"
-            "· /say &lt;编号&gt; &lt;文字&gt; — 给某任务续话；也可直接“回复”它的进度卡\n"
+            "· /say &lt;编号&gt; &lt;文字&gt; — 给指定任务发一句并切为当前会话\n"
+            "· /attach &lt;短ID&gt; — 文本方式接管电脑会话（同 /sessions）\n"
             "· /cancel &lt;编号&gt; — 终止任务\n"
-            "· /resume — <b>弹面板</b>选要续接的任务，点按后回复确认消息即续话\n"
-            "· /sessions — <b>弹面板</b>选电脑上开的会话，点按即接管（免手打长 ID）\n"
-            "· /attach &lt;短ID&gt; — 文本方式接管（与 /sessions 面板等价）\n"
             "· /model — <b>弹面板</b>设默认模型（/new 不带 -m 时用它）\n"
             "· /rename &lt;编号&gt; &lt;新名&gt; — 重命名任务，列表更好认\n\n"
             "<b>审批</b>：危险工具会弹 ✅批准/❌拒绝/⚡全批 按钮；"
-            "本机agents-island与手机哪边先点哪边算数。\n"
+            "本机 agents-island 与手机哪边先点哪边算数。\n"
             "进度卡带 sid，回电脑可 <code>claude --resume &lt;sid&gt;</code> 接管。")
 
     def _cmd_new(self, chat_id, text, msg_id=None):
@@ -635,10 +686,12 @@ class Daemon:
         self._enqueue({"kind": "new", "task_id": task_id, "chat_id": chat_id,
                        "prompt": rest, "model": model, "title": rest[:60],
                        "session_id": sid})
+        # /new 开新会话 → 设为当前会话，此后普通文本都接着它连续对话
+        self._set_current(chat_id, task_id)
         # 给用户的 /new 消息加 👀 反应：比"排队中"文字更即时的"已收到、在处理"信号
         if msg_id is not None:
             self.api.set_message_reaction(chat_id, msg_id, "👀")
-        self._send(chat_id, f"✅ 已受理任务 #{task_id}，排队执行中。")
+        self._send(chat_id, f"✅ 已开新会话 #{task_id}，之后直接发消息即可接着聊。")
 
     # ── /model：默认模型选择（面板）+ 持久化 ─────────────────────────────────
     def _load_default_model(self):
@@ -745,13 +798,13 @@ class Daemon:
             self._send(chat_id,
                        f"任务 #{task['task_id']} 无会话 ID，无法接力。")
             return
+        self._set_current(chat_id, task["task_id"])   # /say 或回复卡也切为当前会话
         self.store.update_status(task["task_id"], tasks.STATUS_QUEUED,
                                  last_event="接力续话")
         self._enqueue({"kind": "resume", "task_id": task["task_id"],
                        "chat_id": chat_id, "prompt": body,
                        "model": task["model"], "title": task["title"],
                        "session_id": task["session_id"]})
-        self._send(chat_id, f"✅ 已接力任务 #{task['task_id']}，排队执行中。")
 
     def _cmd_cancel(self, chat_id, text):
         parts = text.split()
@@ -854,11 +907,13 @@ class Daemon:
         if len(matches) > 1:
             self._send(chat_id, f"短ID「{short}」不唯一，请提供更多字符。")
             return
-        self._attach_and_anchor(chat_id, matches[0])
+        tid = self._attach_session(chat_id, matches[0])
+        if tid:
+            self._send(chat_id, f"✅ 已切到会话 #{tid}，直接发消息即可续话。")
 
-    def _attach_and_anchor(self, chat_id, full):
-        """接管会话 full → 登记台账 → 发锚点消息并设为进度卡 id（回复即续话）。
-        返回 task_id；会话已有活跃任务时返回 None 并提示（C4 互斥）。"""
+    def _attach_session(self, chat_id, full):
+        """接管会话 full → 登记台账 → 「切为当前会话」。
+        返回 task_id；会话已有活跃任务时返回 None 并提示（防双端 resume）。"""
         if full in self.store.active_session_ids():
             self._send(chat_id, "该会话已有活跃任务，拒绝重复接管（防双端 resume）。")
             return None
@@ -866,22 +921,8 @@ class Daemon:
         task_id = self.store.create(session_id=full, title=summary,
                                     origin="attach", status=tasks.STATUS_QUEUED,
                                     chat_id=chat_id)
-        mid = self._anchor_message(chat_id, task_id, summary, full)
+        self._set_current(chat_id, task_id)   # 切为当前会话：此后普通文本接着它聊
         return task_id
-
-    def _anchor_message(self, chat_id, task_id, summary, full):
-        # 锚点消息：其 message_id 存为 progress_msg_id，用户回复本条即路由到 _say 续话。
-        # 用 ForceReply 直接弹出引用式输入框（客户端自动锁定回复本条），免手动找消息回复。
-        force = {"force_reply": True, "selective": True,
-                 "input_field_placeholder": f"续话给任务 #{task_id}…"}
-        mid = self.api.send_message(
-            chat_id,
-            f"✅ 已选任务 #{task_id}（{full[:8]}）：{summary}\n"
-            f"↩️ 直接在下方输入即可续话（或 /say {task_id} &lt;文本&gt;）。",
-            reply_markup=force)
-        if mid:
-            self.store.update_fields(task_id, progress_msg_id=mid)
-        return mid
 
     # ── /sessions 辅助 ──────────────────────────────────────────────────────
     def _session_path(self, stem):
@@ -977,7 +1018,7 @@ class Daemon:
         with open(self.cfg.OFFSET_FILE, "w") as f:
             f.write(str(n))
 
-    # ── CLI 版本自检──────────────────────────────────────────
+    # ── CLI 版本自检 ────────────────────────────────────────────────────────
     def _version_selfcheck(self):
         try:
             out = subprocess.run([runner.CLAUDE_BIN, "--version"],
@@ -995,7 +1036,7 @@ class Daemon:
         if prev and cur and prev != cur:
             self._send(self.cfg.CHAT_ID,
                        f"⚠️ 检测到 Claude CLI 版本变化（{prev} → {cur}），"
-                       f"stream-json/hook 协议可能变更，建议回归 预研实测。")
+                       f"stream-json/hook 协议可能变更，建议回归实测。")
         try:
             parent = os.path.dirname(self.cfg.CLI_VERSION_FILE)
             if parent:

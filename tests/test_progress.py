@@ -169,12 +169,12 @@ def test_state_machine_and_finish_notify(clock):
     assert "完成" in send.calls[-1][1]
 
 
-# ── 批次D：状态草稿 vs 最终答案分离 ───────────────────────────────────────
+# ── 状态草稿 vs 最终答案分离 ───────────────────────────────────────
 def test_final_answer_sent_as_separate_message(clock):
     send, edit = FakeSend(), FakeEdit()
     card = _make(send, edit, clock)
     # 收到 result 事件（含最终答案全文）
-    answer = "这是最终答案：清算周报提纲一、二、三……" * 3
+    answer = "这是最终答案：周报提纲一、二、三……" * 3
     card.handle_event({"type": "result", "ok": True, "result_text": answer,
                        "permission_denials": []})
     card.finish("done")

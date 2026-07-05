@@ -15,8 +15,13 @@
 #   · 线程安全：handle_event 可能由 runner 线程调、finish 由 daemon 线程调，
 #     内部状态一律 threading.Lock 保护。
 
+import os
+import sys
 import threading
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config   # noqa: E402 — 仅用其 md_to_html（config 无重依赖，安全）
 
 # 卡片文本总长上限——Telegram 单条消息硬限约 4096，留裕量取 4000（超长先砍节点区）
 _CARD_MAX = 4000
@@ -53,6 +58,29 @@ def _chunk(text, size):
     if len(text) <= size:
         return [text]
     return [text[i:i + size] for i in range(0, len(text), size)]
+
+
+def _chunk_lines(text, size):
+    # 按行边界分段（尽量不在一行中间切，避免把行内 **加粗** 劈成半个标签）；
+    # 单行超 size 时才对该行硬切。
+    text = text or ""
+    if len(text) <= size:
+        return [text]
+    out, buf = [], ""
+    for line in text.split("\n"):
+        if len(line) > size:                      # 超长单行：先冲走缓冲，再硬切该行
+            if buf:
+                out.append(buf); buf = ""
+            out.extend(line[i:i + size] for i in range(0, len(line), size))
+            continue
+        cand = line if not buf else buf + "\n" + line
+        if len(cand) > size:
+            out.append(buf); buf = line
+        else:
+            buf = cand
+    if buf:
+        out.append(buf)
+    return out or [""]
 
 
 class ProgressCard:
@@ -131,12 +159,13 @@ class ProgressCard:
             label = _STATUS_LABEL.get(status, status)
             emoji = _STATUS_EMOJI.get(status, "")
             if status == "done" and self._final_text:
-                # 成功且有答案：标题头 + 全文（超长分段，末段附完成标记）
+                # 成功且有答案：标题头 + 全文。按行边界分段再逐段 Markdown→HTML
+                # （行内加粗不跨行，故不会把 <b> 劈成半个标签导致 Telegram 400）。
                 head = f"🏁 任务 #{self.task_id} 完成"
-                chunks = _chunk(self._final_text, _CARD_MAX)
-                self.send_fn(self.chat_id, f"{head}\n\n{chunks[0]}")
+                chunks = _chunk_lines(self._final_text, 3500)
+                self.send_fn(self.chat_id, f"{head}\n\n{config.md_to_html(chunks[0])}")
                 for extra in chunks[1:]:
-                    self.send_fn(self.chat_id, extra)
+                    self.send_fn(self.chat_id, config.md_to_html(extra))
             else:
                 # 失败/取消/中断/无答案：发简短状态通知（note 优先，回退标题）
                 note_text = note if note else self.title
