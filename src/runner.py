@@ -18,6 +18,8 @@ import threading
 import time
 import uuid
 
+import session_lock   # 会话跨进程互斥：起进程前拿锁，防并发写坏 transcript
+
 # 约束：可经环境变量覆盖，测试用假 claude 桩替换，避免消耗真实额度
 CLAUDE_BIN = os.environ.get("TG_LR_CLAUDE_BIN", "claude")
 
@@ -68,6 +70,53 @@ def _terminate_group(pgid, grace=_TERM_GRACE):
 def cancel(pgid, grace=_TERM_GRACE):
     # 供上层 /cancel 调用：与超时同款 TERM→KILL 序列
     _terminate_group(pgid, grace)
+
+
+# ── 硬超时定时器表（/extend 运行中重挂）──────────────────────────────────────
+# session_id -> {"timer": Timer, "on_timeout": fn}。runner 线程武装/撤除，
+# /extend 从 daemon 线程重挂——全程 _TIMERS_LOCK 串行化，避免竞态。
+_TIMERS = {}
+_TIMERS_LOCK = threading.Lock()
+
+
+def _arm_timer(session_id, timeout, on_timeout):
+    timer = threading.Timer(timeout, on_timeout)
+    timer.daemon = True
+    with _TIMERS_LOCK:
+        old = _TIMERS.get(session_id)
+        if old:
+            old["timer"].cancel()
+        _TIMERS[session_id] = {"timer": timer, "on_timeout": on_timeout}
+    timer.start()
+    return timer
+
+
+def _disarm_timer(session_id):
+    with _TIMERS_LOCK:
+        rec = _TIMERS.pop(session_id, None)
+    if rec:
+        rec["timer"].cancel()
+
+
+def extend(session_id, seconds):
+    """把在跑会话的硬超时从'现在'起重设为 seconds。成功返回 True。
+
+    任务不在本进程运行（无注册定时器）返回 False。
+    铁律：先武装新定时器、再撤旧的——保证任一瞬间至少一个已武装，绝不出现
+          "撤了旧的、新的没起来"导致任务失去超时保护无限跑。
+    """
+    if not session_id or seconds <= 0:
+        return False
+    with _TIMERS_LOCK:
+        rec = _TIMERS.get(session_id)
+        if not rec:
+            return False
+        new_timer = threading.Timer(seconds, rec["on_timeout"])
+        new_timer.daemon = True
+        new_timer.start()
+        rec["timer"].cancel()
+        rec["timer"] = new_timer
+    return True
 
 
 def _child_env():
@@ -163,6 +212,28 @@ def _run(argv, on_event, cwd, timeout, session_id):
     （阻塞语义）；上层若需中途 cancel，应在起线程前另行掌握 pgid
     （或由子进程自曝其进程组，测试即用此法）。
     """
+    # ── 会话互斥：起进程前拿锁 ──────────────────────────────────────────
+    # ① PC 端正持有该会话（心跳 TTL 内）→ 跳过不起进程，防并发写坏 transcript。
+    if session_lock.pc_active(session_id):
+        _emit(on_event, {"type": "error", "reason": "locked",
+                         "message": "该会话正在电脑上打开，已跳过以防写坏 transcript"})
+        return {"session_id": session_id, "pid": None, "pgid": None,
+                "returncode": None, "bad_lines": 0, "locked": True}
+    # ② TG flock 拿不到（另一 `-p` 进程正在跑同一会话）→ 同样跳过。
+    lock_fd = session_lock.acquire_tg(session_id)
+    if lock_fd is None:
+        _emit(on_event, {"type": "error", "reason": "locked",
+                         "message": "该会话正被另一进程占用，已跳过以防写坏 transcript"})
+        return {"session_id": session_id, "pid": None, "pgid": None,
+                "returncode": None, "bad_lines": 0, "locked": True}
+    try:
+        return _run_locked(argv, on_event, cwd, timeout, session_id)
+    finally:
+        session_lock.release_tg(lock_fd)
+
+
+def _run_locked(argv, on_event, cwd, timeout, session_id):
+    """已持有会话 flock 的实际运行体（见 _run 的锁语义）。"""
     proc = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
@@ -203,9 +274,8 @@ def _run(argv, on_event, cwd, timeout, session_id):
         state["timed_out"] = True
         _terminate_group(pgid)
 
-    timer = threading.Timer(timeout, _on_timeout)
-    timer.daemon = True
-    timer.start()
+    # 注册到全局定时器表，使 /extend 能在运行中重挂硬超时
+    _arm_timer(session_id, timeout, _on_timeout)
 
     bad_lines = 0
     try:
@@ -222,7 +292,7 @@ def _run(argv, on_event, cwd, timeout, session_id):
             if is_result and _obj.get("is_error"):
                 state["error_emitted"] = True
     finally:
-        timer.cancel()
+        _disarm_timer(session_id)
 
     proc.wait()
     stderr_thread.join(timeout=1.0)

@@ -11,6 +11,7 @@
 # 顶层绝不 import progress——worker 内 lazy import，
 #   模块不存在时降级为仅日志，保证本批可独立测试。
 
+import collections
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config   # noqa: E402
 import runner   # noqa: E402
+import session_lock   # noqa: E402 — 会话跨进程互斥
 import tasks     # noqa: E402
 
 log = logging.getLogger("tg-longrange")
@@ -61,6 +63,10 @@ BOT_COMMANDS = [
     {"command": "say",      "description": "给某任务续话：/say 编号 文字"},
     {"command": "model",    "description": "设默认模型（弹面板；/new 不带 -m 时用它）"},
     {"command": "rename",   "description": "重命名任务：/rename 编号 新名称"},
+    {"command": "current",  "description": "看当前会话+回电脑接管命令+最近上文"},
+    {"command": "watch",    "description": "观察电脑会话：其审批也推手机（/watch 编号|ID）"},
+    {"command": "unwatch",  "description": "取消观察（无参=全部取消）"},
+    {"command": "extend",   "description": "延长在跑任务硬超时：/extend 编号 [小时]"},
     {"command": "cancel",   "description": "终止某任务：/cancel 编号"},
     {"command": "attach",   "description": "按短ID接管会话：/attach 短ID"},
     {"command": "help",     "description": "查看用法"},
@@ -245,12 +251,20 @@ class Daemon:
             os.path.dirname(cfg.OFFSET_FILE), "current_sessions.json")
         self._current = self._load_current()   # {chat_id(str): task_id(int)}
         self._current_lock = threading.Lock()
+        # 显式观察集（/watch）：把 PC 会话 sid 并入 relay 活跃集，使其审批推手机。
+        # 持久化跨重启；与 OFFSET_FILE 同目录，测试经 OFFSET_FILE patch 自动隔离。
+        self._watched_file = os.path.join(
+            os.path.dirname(cfg.OFFSET_FILE), "watched.json")
+        self._watched = self._load_watched()   # set(sid)
+        self._watched_lock = threading.Lock()
         # 审批中继：daemon 内线程，构造即备好，run() 时 start()。
         # 延迟导入避免纯路由测试硬依赖；缺失时降级为无中继（callback 只静默 answer）。
         self._relay = None
         try:
             import approval_relay
             self._relay = approval_relay.ApprovalRelay(api, store, cfg)
+            # 注入观察集提供者：/watch 的会话审批也推手机
+            self._relay.watched_provider = self.watched_set
         except Exception as e:   # noqa: BLE001
             log.warning("审批中继初始化失败，callback 将仅静默应答: %s",
                         config.redact(repr(e)))
@@ -361,15 +375,16 @@ class Daemon:
                     except Exception as e:   # noqa: BLE001
                         log.warning("进度卡事件处理失败: %s", config.redact(repr(e)))
 
+            task_timeout = self._task_timeout(row)   # attach 接管的放宽到 4h
             try:
                 if item["kind"] == "resume":
                     runner.resume(item["session_id"], item["prompt"], model=model,
                                   on_event=on_event, cwd=self.cfg.WORKDIR,
-                                  timeout=self.cfg.TASK_TIMEOUT)
+                                  timeout=task_timeout)
                 else:
                     runner.start(item["prompt"], model=model, on_event=on_event,
                                  session_id=item.get("session_id"),
-                                 cwd=self.cfg.WORKDIR, timeout=self.cfg.TASK_TIMEOUT)
+                                 cwd=self.cfg.WORKDIR, timeout=task_timeout)
             except Exception as e:   # noqa: BLE001
                 log.error("任务执行异常 task=%s: %s", task_id, config.redact(repr(e)))
                 self.store.update_status(task_id, tasks.STATUS_FAILED,
@@ -454,7 +469,7 @@ class Daemon:
     def _handle_callback(self, cq):
         data = cq.get("data") or ""
         # 面板选择回调（daemon 自管）：白名单闸在前（S1），再路由
-        if data.startswith(("sess:", "tsel:", "mdl:", "sesspg:", "taskpg:")):
+        if data.startswith(("sess:", "tsel:", "mdl:", "sesspg:", "taskpg:", "force:")):
             frm = cq.get("from") or {}
             if frm.get("id") not in self.cfg.ALLOWED_USER_IDS:
                 log.info("丢弃非白名单 picker callback from.id=%s", frm.get("id"))
@@ -474,6 +489,8 @@ class Daemon:
                 self._cb_pick_session(chat_id, data[len("sess:"):], cq.get("id"), mid)
             elif data.startswith("tsel:"):
                 self._cb_pick_task(chat_id, data[len("tsel:"):], cq.get("id"), mid)
+            elif data.startswith("force:"):
+                self._cb_force_take(chat_id, data[len("force:"):], cq.get("id"), mid)
             else:
                 self._cb_pick_model(chat_id, data[len("mdl:"):], cq.get("id"), mid)
             return
@@ -508,7 +525,8 @@ class Daemon:
         task_id = self._attach_session(chat_id, full)
         if task_id:
             self._collapse_panel(
-                chat_id, mid, f"✅ 已切到会话 #{task_id}，直接发消息即可续话。")
+                chat_id, mid, f"✅ 已切到会话 #{task_id}，直接发消息即可续话。"
+                + self._handoff_echo(full))
         self.api.answer_callback_query(
             cq_id, text=("已切到该会话" if task_id else "该会话已有活跃任务"))
 
@@ -524,8 +542,30 @@ class Daemon:
         self._set_current(chat_id, task["task_id"])
         self._collapse_panel(
             chat_id, mid,
-            f"✅ 已切到会话 #{task['task_id']}：{task['title'] or ''}\n直接发消息即可续话。")
+            f"✅ 已切到会话 #{task['task_id']}：{config._esc(task['title'] or '')}\n"
+            "直接发消息即可续话。" + self._handoff_echo(task["session_id"]))
         self.api.answer_callback_query(cq_id, text="已切到该会话")
+
+    def _cb_force_take(self, chat_id, sid, cq_id, mid=None):
+        """强制接手：用户确认电脑端已空闲 → 清 PC 心跳软锁 + 切为当前会话。
+
+        若 PC 会话之后又活跃起来会重新写心跳、防护自动复位——本次仅越过"当下"这道锁。
+        已有台账任务则复用（不重复建行）；否则按 attach 登记。
+        """
+        session_lock.release_pc(sid)
+        task = self.store.get_by_session(sid)
+        if task:
+            self._set_current(chat_id, task["task_id"])
+            tid = task["task_id"]
+        else:
+            tid = self._attach_session(chat_id, sid, force=True)
+        if tid:
+            self._collapse_panel(
+                chat_id, mid,
+                f"⚡ 已强制接手会话 #{tid}，直接发消息即可续话。" + self._handoff_echo(sid))
+            self.api.answer_callback_query(cq_id, text="已强制接手")
+        else:
+            self.api.answer_callback_query(cq_id, text="接手失败")
 
     # ── 图片消息（视觉问答）────────────────────────────────────────────────
     def _handle_photo(self, msg, chat_id):
@@ -567,6 +607,76 @@ class Daemon:
         except (OSError, ValueError):
             return {}
 
+    # ── 观察集（/watch）────────────────────────────────────────────────────
+    def _load_watched(self):
+        try:
+            with open(self._watched_file, encoding="utf-8") as f:
+                data = json.load(f)
+            return {str(s) for s in data if s}
+        except (OSError, ValueError, TypeError):
+            return set()
+
+    def _save_watched(self):
+        try:
+            os.makedirs(os.path.dirname(self._watched_file), exist_ok=True)
+            with open(self._watched_file, "w", encoding="utf-8") as f:
+                json.dump(sorted(self._watched), f)
+        except OSError as e:
+            log.warning("观察集持久化失败: %s", config.redact(repr(e)))
+
+    def watched_set(self):
+        # relay 注入调用：返回快照副本，避免并发迭代时被改
+        with self._watched_lock:
+            return set(self._watched)
+
+    def _resolve_sid(self, token):
+        """把 <编号|sid|短前缀> 解析成完整 session_id；无法解析返回 None。"""
+        if token.isdigit():
+            task = self.store.get(int(token))
+            return task["session_id"] if task and task["session_id"] else None
+        stems = self._all_session_stems()
+        if token in stems:
+            return token
+        matches = [s for s in stems if s.startswith(token)]
+        return matches[0] if len(matches) == 1 else None
+
+    def _cmd_watch(self, chat_id, text):
+        """/watch <编号|sid>：把会话并入观察集，其工具审批也推手机。"""
+        parts = text.split()
+        if len(parts) < 2:
+            self._send(chat_id,
+                       "用法：/watch <任务编号|会话ID>\n"
+                       "把电脑上开的会话加入观察，其危险工具审批也会推到手机。")
+            return
+        sid = self._resolve_sid(parts[1])
+        if not sid:
+            self._send(chat_id, f"未找到「{parts[1]}」对应的会话（可先 /tasks 或 /sessions 看）。")
+            return
+        with self._watched_lock:
+            self._watched.add(sid)
+            self._save_watched()
+        self._send(chat_id,
+                   f"👁 已观察会话 <code>{sid}</code>\n"
+                   "其审批将推到手机。取消：/unwatch 同一编号/ID。")
+
+    def _cmd_unwatch(self, chat_id, text):
+        parts = text.split()
+        if len(parts) < 2:
+            with self._watched_lock:
+                n = len(self._watched)
+                self._watched.clear()
+                self._save_watched()
+            self._send(chat_id, f"已取消全部观察（{n} 个）。" if n else "当前没有观察中的会话。")
+            return
+        sid = self._resolve_sid(parts[1])
+        with self._watched_lock:
+            target = sid if sid in self._watched else parts[1]
+            removed = target in self._watched
+            self._watched.discard(target)
+            if removed:
+                self._save_watched()
+        self._send(chat_id, "已取消观察。" if removed else "该会话不在观察集内。")
+
     def _set_current(self, chat_id, task_id):
         with self._current_lock:
             self._current[str(chat_id)] = task_id
@@ -576,6 +686,28 @@ class Daemon:
                     json.dump(self._current, f)
             except OSError as e:
                 log.warning("当前会话指针持久化失败: %s", config.redact(repr(e)))
+
+    def _pc_busy(self, chat_id, sid):
+        """PC 端正持有该会话（心跳 TTL 内）→ 提示并拒接手，返回 True 表示已拦截。
+
+        防 PC 交互 claude 与 TG `-p` 并发写同一 .jsonl。检查异常一律放行（宁漏挡不误锁）。
+        附「强制接手」按钮：用户确认电脑端已空闲/在等指令时，一键越过软锁。
+        """
+        try:
+            if session_lock.pc_active(sid):
+                kb = {"inline_keyboard": [[{
+                    "text": "⚡ 电脑已空闲，仍要接手",
+                    "callback_data": f"force:{sid}"}]]}
+                self._send(
+                    chat_id,
+                    "⚠️ 该会话正在电脑上打开，为防写坏对话记录已暂不接手。\n"
+                    "· 在电脑上结束该会话（或等约 90 秒空闲）后重试；\n"
+                    "· 若确认电脑端已空闲/在等你，点下方强制接手。",
+                    reply_markup=kb)
+                return True
+        except Exception as e:   # noqa: BLE001 — 锁检查绝不能拖垮消息路由
+            log.warning("会话锁检查异常，放行: %s", config.redact(repr(e)))
+        return False
 
     def _converse(self, chat_id, text, msg_id=None):
         # 默认连续对话：普通文本接着「当前会话」聊（有记忆）。无则新建；running 则请稍候。
@@ -588,6 +720,9 @@ class Daemon:
             self._send(chat_id, "⏳ 还在处理上一条，完成后再发（或 /new 开新对话）。")
             return
         if task and task["session_id"]:
+            # PC 端正打开该会话 → 拒接手防并发写坏
+            if self._pc_busy(chat_id, task["session_id"]):
+                return
             # 接着聊：resume 当前会话（安静入队，进度卡会显示处理态，不再刷"已受理"）
             self.store.update_status(task["task_id"], tasks.STATUS_QUEUED,
                                      last_event="连续对话续话")
@@ -627,6 +762,14 @@ class Daemon:
             self._cmd_model(chat_id, text)
         elif cmd == "/rename":
             self._cmd_rename(chat_id, text)
+        elif cmd == "/current":
+            self._cmd_current(chat_id)
+        elif cmd == "/watch":
+            self._cmd_watch(chat_id, text)
+        elif cmd == "/unwatch":
+            self._cmd_unwatch(chat_id, text)
+        elif cmd == "/extend":
+            self._cmd_extend(chat_id, text)
         elif cmd in ("/help", "/start"):
             self._send(chat_id, self._help_text())
         else:
@@ -643,14 +786,18 @@ class Daemon:
             "<b>切换/管理会话</b>（“当前会话”只有一个，切了就直接聊）\n"
             "· /resume — <b>弹面板</b>选一个任务<b>切为当前会话</b>，之后直接发消息续话\n"
             "· /sessions — <b>弹面板</b>选电脑上开的会话切为当前（免手打长 ID）\n"
+            "· /current — 看<b>当前会话</b>是哪个 + 回电脑接管命令 + 最近上文\n"
             "· /tasks — 列最近任务（编号/状态/短 sid）\n"
             "· /say &lt;编号&gt; &lt;文字&gt; — 给指定任务发一句并切为当前会话\n"
             "· /attach &lt;短ID&gt; — 文本方式接管电脑会话（同 /sessions）\n"
             "· /cancel &lt;编号&gt; — 终止任务\n"
+            "· /extend &lt;编号&gt; [小时] — 延长在跑任务的硬超时（默认 +2h，防长任务被 2h 杀）\n"
             "· /model — <b>弹面板</b>设默认模型（/new 不带 -m 时用它）\n"
             "· /rename &lt;编号&gt; &lt;新名&gt; — 重命名任务，列表更好认\n\n"
             "<b>审批</b>：危险工具会弹 ✅批准/❌拒绝/⚡全批 按钮；"
             "本机 agents-island 与手机哪边先点哪边算数。\n"
+            "· /watch &lt;编号|ID&gt; — 把电脑上开的会话加入观察，其审批也推手机；"
+            "/unwatch 取消\n"
             "进度卡带 sid，回电脑可 <code>claude --resume &lt;sid&gt;</code> 接管。")
 
     def _cmd_new(self, chat_id, text, msg_id=None):
@@ -768,12 +915,18 @@ class Daemon:
         if not rows:
             self._send(chat_id, "暂无任务记录。")
             return
-        lines = []
+        # 每条任务附上 PC 端接管命令（<code> 点击即复制）；无会话 ID 则不可接管。
+        # 标题经 _esc 转义，杜绝 parse_mode=HTML 解析失败。
+        lines = ["📋 任务列表（PC 接管：点下方命令复制；TG 接管：/say <编号> <文本>）", ""]
         for r in rows:
             emoji = _STATUS_EMOJI.get(r["status"], "❔")
-            sid = (r["session_id"] or "")[:8]
-            title = r["title"] or "(无标题)"
-            lines.append(f"{emoji} #{r['task_id']} {title}  [{sid}]")
+            title = config._esc(r["title"] or "(无标题)")
+            lines.append(f"{emoji} #{r['task_id']} {title}")
+            sid = r["session_id"] or ""
+            if sid:
+                lines.append(f"   <code>claude --resume {sid}</code>")
+            else:
+                lines.append("   (无会话 ID，暂不可接管)")
         self._send(chat_id, "\n".join(lines))
 
     def _cmd_say(self, chat_id, text):
@@ -798,6 +951,9 @@ class Daemon:
             self._send(chat_id,
                        f"任务 #{task['task_id']} 无会话 ID，无法接力。")
             return
+        # PC 端正打开该会话 → 拒接手防并发写坏
+        if self._pc_busy(chat_id, task["session_id"]):
+            return
         self._set_current(chat_id, task["task_id"])   # /say 或回复卡也切为当前会话
         self.store.update_status(task["task_id"], tasks.STATUS_QUEUED,
                                  last_event="接力续话")
@@ -805,6 +961,45 @@ class Daemon:
                        "chat_id": chat_id, "prompt": body,
                        "model": task["model"], "title": task["title"],
                        "session_id": task["session_id"]})
+
+    def _task_timeout(self, task):
+        """任务硬超时（秒）：attach 接管的会话放宽到 4h，其余用默认 2h。"""
+        if task and task.get("origin") == "attach":
+            return int(getattr(self.cfg, "ATTACH_TASK_TIMEOUT",
+                               self.cfg.TASK_TIMEOUT))
+        return self.cfg.TASK_TIMEOUT
+
+    def _cmd_extend(self, chat_id, text):
+        """/extend <编号> [小时]：把在跑任务的硬超时从现在起延长，默认 +2h。"""
+        parts = text.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            self._send(chat_id, "用法：/extend <任务编号> [小时]（默认 +2 小时）")
+            return
+        task = self.store.get(int(parts[1]))
+        if not task:
+            self._send(chat_id, f"任务 #{parts[1]} 不存在。")
+            return
+        hours = 2.0
+        if len(parts) >= 3:
+            try:
+                hours = float(parts[2])
+            except ValueError:
+                self._send(chat_id, "小时数须为数字，如 /extend 3 4")
+                return
+            if hours <= 0 or hours > 12:   # 硬顶 12h：防额度失控
+                self._send(chat_id, "小时数须在 0（不含）~12 之间。")
+                return
+        if task["status"] != tasks.STATUS_RUNNING:
+            self._send(chat_id,
+                       f"任务 #{task['task_id']} 未在运行，无需延长；续话会重新计时。")
+            return
+        ok = runner.extend(task["session_id"], hours * 3600)
+        if ok:
+            self._send(chat_id,
+                       f"⏱ 已把任务 #{task['task_id']} 的硬超时从现在起设为 {hours:g} 小时。")
+        else:
+            self._send(chat_id,
+                       f"任务 #{task['task_id']} 不在本机运行（可能刚结束或经历过重启），无法延长。")
 
     def _cmd_cancel(self, chat_id, text):
         parts = text.split()
@@ -911,13 +1106,17 @@ class Daemon:
         if tid:
             self._send(chat_id, f"✅ 已切到会话 #{tid}，直接发消息即可续话。")
 
-    def _attach_session(self, chat_id, full):
+    def _attach_session(self, chat_id, full, force=False):
         """接管会话 full → 登记台账 → 「切为当前会话」。
-        返回 task_id；会话已有活跃任务时返回 None 并提示（防双端 resume）。"""
+        返回 task_id；会话已有活跃任务时返回 None 并提示（防双端 resume）。
+        force=True 越过 PC 软锁（用户确认电脑端已空闲，见 _cb_force_take）。"""
         if full in self.store.active_session_ids():
             self._send(chat_id, "该会话已有活跃任务，拒绝重复接管（防双端 resume）。")
             return None
-        summary = self._first_user_summary(self._session_path(full))
+        # PC 端正打开该会话 → 拒接管防并发写坏；force 时跳过
+        if not force and self._pc_busy(chat_id, full):
+            return None
+        summary = self._session_title(self._session_path(full))
         task_id = self.store.create(session_id=full, title=summary,
                                     origin="attach", status=tasks.STATUS_QUEUED,
                                     chat_id=chat_id)
@@ -948,7 +1147,8 @@ class Daemon:
             out.append({
                 "short": stem[:8], "full": stem,
                 "mtime": os.path.getmtime(p),
-                "summary": self._first_user_summary(p),
+                # 辨识度：优先 AI 生成标题，回退首条用户消息 + mtime 已在按钮上
+                "summary": self._session_title(p),
             })
         return out
 
@@ -994,6 +1194,103 @@ class Daemon:
             return "(无法解析)"
         except OSError:
             return "(无法解析)"
+
+    @staticmethod
+    def _session_title(path, max_scan=80, maxlen=60):
+        """会话展示标题：优先取会话自带 AI 标题（type=='ai-title' 的 aiTitle 字段，
+        取窗口内最后一条=最新），回退首条用户消息摘要。宽容解析。"""
+        ai_title = None
+        try:
+            with open(path, encoding="utf-8") as f:
+                for _ in range(max_scan):
+                    line = f.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(obj, dict) and obj.get("type") == "ai-title":
+                        t = (obj.get("aiTitle") or "").strip()
+                        if t:
+                            ai_title = t
+        except OSError:
+            return "(无法解析)"
+        if ai_title:
+            return ai_title[:maxlen]
+        return Daemon._first_user_summary(path)
+
+    @staticmethod
+    def _tail_session(path, tail_lines=400, maxlen=280):
+        """读会话 .jsonl 尾部，取最后一条 assistant 文本 + 最后一次工具动作。
+
+        接手回显用：手机上没有终端 scrollback，回显让"接得到"变"接得上"。
+        用 deque 只留末 tail_lines 行，界定大 transcript 的内存/耗时。宽容解析。
+        """
+        last_text = None
+        last_tool = None
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = collections.deque(f, maxlen=tail_lines)
+        except OSError:
+            return None, None
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                continue
+            content = (obj.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text" and part.get("text", "").strip():
+                    last_text = part["text"].strip()
+                elif part.get("type") == "tool_use" and part.get("name"):
+                    last_tool = part["name"]
+        if last_text and len(last_text) > maxlen:
+            last_text = last_text[:maxlen] + "…"
+        return last_text, last_tool
+
+    def _handoff_echo(self, sid):
+        """构造接手回显文本块（会话尾部上文）。无上文返回空串。"""
+        if not sid:
+            return ""
+        text, tool = self._tail_session(self._session_path(sid))
+        if not text and not tool:
+            return ""
+        parts = []
+        if text:
+            parts.append(f"🗒 最近回复：{config._esc(text)}")
+        if tool:
+            parts.append(f"🔧 最近动作：{config._esc(tool)}")
+        return "\n" + "\n".join(parts)
+
+    def _cmd_current(self, chat_id):
+        """/current：打印当前会话标题 + 可点复制 resume 命令 + 尾部上文。"""
+        tid = self._current.get(str(chat_id))
+        task = self.store.get(tid) if tid else None
+        if not task or not task["session_id"]:
+            self._send(chat_id, "当前没有会话。发消息即开新对话，或 /resume、/sessions 选一个。")
+            return
+        sid = task["session_id"]
+        title = config._esc(task["title"] or "(无标题)")
+        emoji = _STATUS_EMOJI.get(task["status"], "❔")
+        lines = [f"🎯 当前会话 {emoji} #{task['task_id']}：{title}",
+                 f"<code>claude --resume {sid}</code>"]
+        echo = self._handoff_echo(sid)
+        if echo:
+            lines.append(echo.lstrip("\n"))
+        self._send(chat_id, "\n".join(lines))
 
     def _task_by_progress_msg(self, message_id):
         if message_id is None:

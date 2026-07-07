@@ -21,6 +21,7 @@ import config   # noqa: E402
 import daemon   # noqa: E402
 import progress  # noqa: E402
 import runner   # noqa: E402
+import session_lock  # noqa: E402
 import tasks     # noqa: E402
 
 # 在任何 monkeypatch 之前抓住真实进度卡类，供集成用例还原（fixture 会把它换成 _NoopCard）
@@ -380,7 +381,7 @@ def test_resume_panel_lists_resumable_tasks(bundle):
 def test_bot_commands_menu_valid_and_covers_router():
     # 「/」菜单命令须格式合法（小写/≤32/描述≤256），且都是路由真实处理的命令
     handled = {"new", "resume", "sessions", "tasks", "say", "cancel", "attach",
-               "help", "model", "rename"}
+               "help", "model", "rename", "current", "watch", "unwatch", "extend"}
     seen = set()
     for c in daemon.BOT_COMMANDS:
         name = c["command"]
@@ -650,3 +651,184 @@ def test_real_progress_card_finish_notifies(bundle, monkeypatch):
     # 另发的终态通知落在 sent 中（编辑落在 edited 中）
     assert wait_for(lambda: any("完成" in s["text"] for s in bundle.api.sent))
     assert bundle.api.edited, "进度卡应至少编辑过一次"
+
+
+# ── 附加：/tasks 附 PC 接管命令 + 标题转义 ──────────────────────────────────
+def test_tasks_lists_resume_command_and_escapes_title(bundle):
+    sid = "7eb0d21b-4eeb-4016-bd88-2527d98620fa"
+    bundle.store.create(session_id=sid, title="任务 <opt> 优化",
+                        status=tasks.STATUS_DONE)
+    bundle.store.create(session_id=None, title="无会话任务",
+                        status=tasks.STATUS_QUEUED)
+    bundle.d.handle_update(msg_update(text="/tasks"))
+    out = bundle.api.all_text()
+    assert f"claude --resume {sid}" in out
+    assert "<code>claude --resume" in out
+    assert "任务 &lt;opt&gt; 优化" in out
+    assert "任务 <opt>" not in out
+    assert "(无会话 ID，暂不可接管)" in out
+
+
+# ── 会话锁守卫：PC 端持有该会话时 TG 拒接手 ─────────────────────────────────
+def test_converse_refused_when_pc_holds_session(bundle, monkeypatch):
+    tid = bundle.store.create(session_id="pc-held-sid", title="路上起的任务",
+                              status=tasks.STATUS_DONE, chat_id=str(WHITELIST_UID))
+    bundle.d._set_current(str(WHITELIST_UID), tid)
+    monkeypatch.setattr(session_lock, "pc_active",
+                        lambda sid, **k: sid == "pc-held-sid")
+    bundle.d.handle_update(msg_update(text="接着把结论写完"))
+    time.sleep(0.15)
+    assert bundle.rcalls["resume"] == []
+    assert "电脑上打开" in bundle.api.all_text()
+
+
+def test_say_refused_when_pc_holds_session(bundle, monkeypatch):
+    tid = bundle.store.create(session_id="pc-held-2", title="任务",
+                              status=tasks.STATUS_DONE, chat_id=str(WHITELIST_UID))
+    monkeypatch.setattr(session_lock, "pc_active",
+                        lambda sid, **k: sid == "pc-held-2")
+    bundle.d.handle_update(msg_update(text=f"/say {tid} 继续"))
+    time.sleep(0.15)
+    assert bundle.rcalls["resume"] == []
+    assert "电脑上打开" in bundle.api.all_text()
+
+
+# ── 强制接手：软锁拦下后一键越过 ────────────────────────────────────────────
+def test_pc_busy_offers_force_button(bundle, monkeypatch):
+    monkeypatch.setattr(session_lock, "pc_active", lambda sid, **k: True)
+    blocked = bundle.d._pc_busy(str(WHITELIST_UID), "busy-sid")
+    assert blocked is True
+    kb = bundle.api.sent[-1]["reply_markup"]["inline_keyboard"]
+    cbs = [btn["callback_data"] for row in kb for btn in row]
+    assert "force:busy-sid" in cbs
+
+
+def test_force_take_releases_lock_and_switches(bundle, monkeypatch):
+    released = []
+    monkeypatch.setattr(session_lock, "release_pc", lambda sid: released.append(sid))
+    tid = bundle.store.create(session_id="force-sid", title="等待中的会话",
+                              status=tasks.STATUS_DONE, chat_id=str(WHITELIST_UID))
+    cq = {"callback_query": {"id": "cbf", "from": {"id": WHITELIST_UID},
+                             "message": {"chat": {"id": WHITELIST_UID},
+                                         "message_id": 888},
+                             "data": "force:force-sid"}}
+    bundle.d.handle_update(cq)
+    assert released == ["force-sid"]
+    assert bundle.d._current[str(WHITELIST_UID)] == tid
+    assert ("cbf", "已强制接手") in bundle.api.answered
+
+
+def test_force_take_non_whitelist_dropped(bundle):
+    cq = {"callback_query": {"id": "cbx", "from": {"id": 999999},
+                             "message": {"chat": {"id": 999999}},
+                             "data": "force:whatever"}}
+    bundle.d.handle_update(cq)
+    assert bundle.d._current == {}
+
+
+# ── /current 回显当前会话 + resume 命令 + 上文 ──────────────────────────────
+def _write_session_multi(dirpath, uuid, mtime, extra_lines):
+    p = os.path.join(dirpath, uuid + ".jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"type":"user","message":{"role":"user","content":"起始问题"}}\n')
+        for ln in extra_lines:
+            f.write(ln + "\n")
+    os.utime(p, (mtime, mtime))
+    return p
+
+
+def test_tail_session_picks_last_assistant_text_and_tool(bundle, tmp_path):
+    sid = "dddddddd-1111-2222-3333-444444444444"
+    lines = [
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"早先的回复"}]}}',
+        '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}',
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"这是最后一条回复"}]}}',
+    ]
+    p = _write_session_multi(str(tmp_path), sid, time.time(), lines)
+    text, tool = bundle.d._tail_session(p)
+    assert text == "这是最后一条回复"
+    assert tool == "Bash"
+
+
+def test_current_shows_resume_and_context(bundle, tmp_path, monkeypatch):
+    sid = "ffffffff-1111-2222-3333-444444444444"
+    sdir = tmp_path / "projects"
+    sdir.mkdir()
+    _write_session_multi(str(sdir), sid, time.time(),
+        ['{"type":"assistant","message":{"content":[{"type":"text","text":"当前进展摘要"}]}}'])
+    monkeypatch.setattr(config, "SESSIONS_PROJECT_DIR", str(sdir))
+    tid = bundle.store.create(session_id=sid, title="路上起的活",
+                              status=tasks.STATUS_DONE, chat_id=str(WHITELIST_UID))
+    bundle.d._set_current(str(WHITELIST_UID), tid)
+    bundle.d.handle_update(msg_update(text="/current"))
+    out = bundle.api.all_text()
+    assert f"claude --resume {sid}" in out
+    assert "路上起的活" in out
+    assert "当前进展摘要" in out
+
+
+def test_current_no_session_hint(bundle):
+    bundle.d.handle_update(msg_update(text="/current"))
+    assert "当前没有会话" in bundle.api.all_text()
+
+
+# ── /watch 观察集 + relay 并入 ──────────────────────────────────────────────
+def test_watch_by_task_id_adds_sid(bundle):
+    tid = bundle.store.create(session_id="watch-sid-1", title="电脑会话",
+                              status=tasks.STATUS_DONE, chat_id=str(WHITELIST_UID))
+    bundle.d.handle_update(msg_update(text=f"/watch {tid}"))
+    assert "watch-sid-1" in bundle.d.watched_set()
+    assert "已观察" in bundle.api.all_text()
+
+
+def test_unwatch_removes(bundle):
+    tid = bundle.store.create(session_id="watch-sid-3", title="x",
+                              status=tasks.STATUS_DONE)
+    bundle.d.handle_update(msg_update(text=f"/watch {tid}"))
+    bundle.d.handle_update(msg_update(text=f"/unwatch {tid}", update_id=2))
+    assert "watch-sid-3" not in bundle.d.watched_set()
+
+
+def test_watch_unknown_token_errors(bundle):
+    bundle.d.handle_update(msg_update(text="/watch 999999"))
+    assert "未找到" in bundle.api.all_text()
+    assert bundle.d.watched_set() == set()
+
+
+# ── /extend 延长在跑任务硬超时 ──────────────────────────────────────────────
+def test_extend_running_task_calls_runner_extend(bundle, monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner, "extend",
+                        lambda sid, secs: (calls.append((sid, secs)) or True))
+    tid = bundle.store.create(session_id="ext-sid", title="长任务",
+                              status=tasks.STATUS_RUNNING, chat_id=str(WHITELIST_UID))
+    bundle.d.handle_update(msg_update(text=f"/extend {tid} 3"))
+    assert calls == [("ext-sid", 3 * 3600)]
+
+
+def test_extend_non_running_hint(bundle):
+    tid = bundle.store.create(session_id="ext-sid3", title="x",
+                              status=tasks.STATUS_DONE)
+    bundle.d.handle_update(msg_update(text=f"/extend {tid}"))
+    assert "未在运行" in bundle.api.all_text()
+
+
+def test_attach_origin_gets_longer_timeout(bundle):
+    assert bundle.d._task_timeout({"origin": "attach"}) == config.ATTACH_TASK_TIMEOUT
+    assert bundle.d._task_timeout({"origin": "new"}) == config.TASK_TIMEOUT
+
+
+# ── _session_title 优先 AI 标题 ─────────────────────────────────────────────
+def test_session_title_prefers_ai_title(bundle, tmp_path):
+    p = os.path.join(str(tmp_path), "s.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"type":"user","message":{"role":"user","content":"原始粗糙的第一句"}}\n')
+        f.write('{"type":"ai-title","aiTitle":"优化会话机制","sessionId":"s"}\n')
+    assert bundle.d._session_title(p) == "优化会话机制"
+
+
+def test_session_title_fallback_to_user_msg(bundle, tmp_path):
+    p = os.path.join(str(tmp_path), "s3.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"type":"user","message":{"role":"user","content":"没有AI标题就用这句"}}\n')
+    assert bundle.d._session_title(p) == "没有AI标题就用这句"

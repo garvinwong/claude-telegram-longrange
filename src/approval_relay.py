@@ -260,6 +260,9 @@ class ApprovalRelay:
         # 抗抖动：连续桥不可达计数；达 _degrade_after 才切文件降级（防单次抖动误降级刷屏）
         self._miss = 0
         self._degrade_after = getattr(cfg, "BRIDGE_DEGRADE_AFTER", _DEGRADE_AFTER)
+        # 显式 opt-in 观察集提供者：daemon 注入 self.watched_set，使 /watch 的会话
+        # 审批也推手机。默认 None → 仅台账活跃集，行为不变。
+        self.watched_provider = None
 
     # ── 线程生命周期 ─────────────────────────────────────────────────────
     def start(self):
@@ -298,6 +301,13 @@ class ApprovalRelay:
             degraded = True
 
         active = self.store.active_session_ids()
+        # 显式 opt-in 观察集并入：/watch 的会话审批也推手机；未 watch 的本机开发
+        # 会话仍被挡在门外（不刷屏）。provider 异常一律降级为空集。
+        if self.watched_provider is not None:
+            try:
+                active = active | set(self.watched_provider())
+            except Exception:   # noqa: BLE001 — 观察集获取失败绝不能拖垮审批中继
+                pass
         # 过滤主条件：会话必须在台账活跃集合内（本机终端开发会话被此闸挡在门外）
         relevant = [e for e in pending
                     if e.get("session_id") in active]

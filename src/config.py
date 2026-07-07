@@ -72,6 +72,8 @@ ALLOWED_MODELS = set(_models or [])
 # ── 并发 / 超时 / 节流 ─────────────────────────────────────────────────────
 MAX_CONCURRENCY = int(_get("max_concurrency", "TGLR_MAX_CONCURRENCY", 2))
 TASK_TIMEOUT = int(_get("task_timeout", "TGLR_TASK_TIMEOUT", 7200))   # 硬超时 2h
+# attach 接管的会话多为"电脑上起的长会话"，放宽到 4h；仍有硬顶防额度失控
+ATTACH_TASK_TIMEOUT = int(_get("attach_task_timeout", "TGLR_ATTACH_TASK_TIMEOUT", 14400))
 PROGRESS_THROTTLE = int(_get("progress_throttle", "TGLR_PROGRESS_THROTTLE", 20))
 TG_MAX = 4000                          # Telegram 单条消息字符上限，超长分段
 
