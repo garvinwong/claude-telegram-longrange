@@ -381,7 +381,7 @@ def test_resume_panel_lists_resumable_tasks(bundle):
 def test_bot_commands_menu_valid_and_covers_router():
     # 「/」菜单命令须格式合法（小写/≤32/描述≤256），且都是路由真实处理的命令
     handled = {"new", "resume", "sessions", "tasks", "say", "cancel", "attach",
-               "help", "model", "rename", "current", "watch", "unwatch", "extend"}
+               "help", "model", "rename", "current", "detach", "watch", "unwatch", "extend"}
     seen = set()
     for c in daemon.BOT_COMMANDS:
         name = c["command"]
@@ -832,3 +832,123 @@ def test_session_title_fallback_to_user_msg(bundle, tmp_path):
     with open(p, "w", encoding="utf-8") as f:
         f.write('{"type":"user","message":{"role":"user","content":"没有AI标题就用这句"}}\n')
     assert bundle.d._session_title(p) == "没有AI标题就用这句"
+
+
+# ── /detach 待机：清当前会话指针，下一条普通消息开全新会话 ────────────────────
+def test_detach_clears_current_next_text_starts_fresh(bundle):
+    tid = bundle.store.create(session_id="old-sid", title="旧会话",
+                              status=tasks.STATUS_DONE, chat_id=str(WHITELIST_UID))
+    bundle.d._set_current(str(WHITELIST_UID), tid)
+    bundle.d.handle_update(msg_update(text="/detach"))
+    assert "待机" in bundle.api.all_text()
+    assert str(WHITELIST_UID) not in bundle.d._current
+    bundle.d.handle_update(msg_update(text="随手问一句", update_id=2))
+    assert wait_for(lambda: len(bundle.rcalls["start"]) == 1)
+    assert bundle.rcalls["resume"] == []
+    assert bundle.rcalls["start"][0]["session_id"] != "old-sid"
+
+
+def test_detach_when_already_idle(bundle):
+    bundle.d.handle_update(msg_update(text="/detach"))
+    assert "本就无会话" in bundle.api.all_text()
+
+
+# ── /watch 无参 → 会话面板点选切换观察 ──────────────────────────────────────
+def test_watch_no_arg_shows_panel(bundle, tmp_path, monkeypatch):
+    sdir = tmp_path / "projects"
+    sdir.mkdir()
+    uuid_a = "abcd9999-1111-2222-3333-444444444444"
+    _write_session(str(sdir), uuid_a, "要观察的会话", time.time())
+    monkeypatch.setattr(config, "SESSIONS_PROJECT_DIR", str(sdir))
+    bundle.d.handle_update(msg_update(text="/watch"))
+    kb = bundle.api.sent[-1]["reply_markup"]["inline_keyboard"]
+    cbs = [btn["callback_data"] for row in kb for btn in row]
+    assert f"wsel:{uuid_a}" in cbs
+    for c in cbs:
+        assert len(c.encode()) < 64
+
+
+def test_wsel_toggles_watch_on_and_off(bundle, tmp_path, monkeypatch):
+    sdir = tmp_path / "projects"
+    sdir.mkdir()
+    uuid_a = "abcd8888-1111-2222-3333-444444444444"
+    _write_session(str(sdir), uuid_a, "点选观察我", time.time())
+    monkeypatch.setattr(config, "SESSIONS_PROJECT_DIR", str(sdir))
+
+    def tap():
+        bundle.d.handle_update({"callback_query": {
+            "id": "cbw", "from": {"id": WHITELIST_UID},
+            "message": {"chat": {"id": WHITELIST_UID}, "message_id": 777},
+            "data": f"wsel:{uuid_a}"}})
+
+    tap()
+    assert uuid_a in bundle.d.watched_set()
+    assert bundle.api.edited, "面板应就地编辑刷新（可连续多选）"
+    tap()
+    assert uuid_a not in bundle.d.watched_set()
+
+
+# ── 旁听流：watch 会话的正文实时推手机（thinking/tool 除外）──────────────────
+def _watch_setup(bundle, tmp_path, monkeypatch, sid="wtch1111-1111-2222-3333-444444444444"):
+    sdir = tmp_path / "projects"
+    sdir.mkdir(exist_ok=True)
+    p = _write_session(str(sdir), sid, "被旁听的会话", time.time())
+    monkeypatch.setattr(config, "SESSIONS_PROJECT_DIR", str(sdir))
+    monkeypatch.setattr(config, "CHAT_ID", str(WHITELIST_UID))
+    with bundle.d._watched_lock:
+        bundle.d._watched.add(sid)
+    return sid, p
+
+
+def test_watch_stream_pushes_new_text_only(bundle, tmp_path, monkeypatch):
+    sid, p = _watch_setup(bundle, tmp_path, monkeypatch)
+    bundle.d._watch_tick()
+    n0 = len(bundle.api.sent)
+    with open(p, "a", encoding="utf-8") as f:
+        f.write('{"type":"assistant","message":{"content":['
+                '{"type":"thinking","thinking":"内心戏不该推"},'
+                '{"type":"tool_use","name":"Bash","input":{"command":"secret"}},'
+                '{"type":"text","text":"这句正文应该推到手机"}]}}\n')
+    bundle.d._watch_tick()
+    out = "\n".join(s["text"] for s in bundle.api.sent[n0:])
+    assert "这句正文应该推到手机" in out
+    assert "内心戏" not in out and "secret" not in out
+    n1 = len(bundle.api.sent)
+    bundle.d._watch_tick()
+    assert len(bundle.api.sent) == n1
+
+
+def test_watch_stream_skips_active_tg_session(bundle, tmp_path, monkeypatch):
+    sid, p = _watch_setup(bundle, tmp_path, monkeypatch)
+    bundle.d._watch_tick()
+    bundle.store.create(session_id=sid, title="tg任务",
+                        status=tasks.STATUS_RUNNING)
+    n0 = len(bundle.api.sent)
+    with open(p, "a", encoding="utf-8") as f:
+        f.write('{"type":"assistant","message":{"content":[{"type":"text","text":"不应双推"}]}}\n')
+    bundle.d._watch_tick()
+    assert all("不应双推" not in s["text"] for s in bundle.api.sent[n0:])
+
+
+def test_watch_stream_holds_partial_line(bundle, tmp_path, monkeypatch):
+    sid, p = _watch_setup(bundle, tmp_path, monkeypatch)
+    bundle.d._watch_tick()
+    n0 = len(bundle.api.sent)
+    with open(p, "a", encoding="utf-8") as f:
+        f.write('{"type":"assistant","message":{"content":[{"type":"text","text":"半行')
+    bundle.d._watch_tick()
+    assert len(bundle.api.sent) == n0
+    with open(p, "a", encoding="utf-8") as f:
+        f.write('未完待续"}]}}\n')
+    bundle.d._watch_tick()
+    assert any("半行未完待续" in s["text"] for s in bundle.api.sent[n0:])
+
+
+def test_watch_stream_unwatch_stops_and_cleans_offset(bundle, tmp_path, monkeypatch):
+    sid, p = _watch_setup(bundle, tmp_path, monkeypatch)
+    bundle.d._watch_tick()
+    assert sid in bundle.d._watch_offsets
+    with bundle.d._watched_lock:
+        bundle.d._watched.discard(sid)
+    bundle.d._watch_tick()
+    assert sid not in bundle.d._watch_offsets

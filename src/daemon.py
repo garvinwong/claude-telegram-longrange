@@ -64,7 +64,8 @@ BOT_COMMANDS = [
     {"command": "model",    "description": "设默认模型（弹面板；/new 不带 -m 时用它）"},
     {"command": "rename",   "description": "重命名任务：/rename 编号 新名称"},
     {"command": "current",  "description": "看当前会话+回电脑接管命令+最近上文"},
-    {"command": "watch",    "description": "观察电脑会话：其审批也推手机（/watch 编号|ID）"},
+    {"command": "detach",   "description": "脱离当前会话待机：之后发消息=开全新对话"},
+    {"command": "watch",    "description": "观察电脑会话：审批+正文推手机（无参弹面板）"},
     {"command": "unwatch",  "description": "取消观察（无参=全部取消）"},
     {"command": "extend",   "description": "延长在跑任务硬超时：/extend 编号 [小时]"},
     {"command": "cancel",   "description": "终止某任务：/cancel 编号"},
@@ -257,6 +258,12 @@ class Daemon:
             os.path.dirname(cfg.OFFSET_FILE), "watched.json")
         self._watched = self._load_watched()   # set(sid)
         self._watched_lock = threading.Lock()
+        # 旁听流（/watch 的正文推送）：尾随被观察会话 transcript 的字节偏移量。
+        # 仅旁听线程读写，无需加锁；daemon 重启从"当时末尾"重新起算（不回放历史）。
+        self._watch_offsets = {}               # {sid: byte_offset}
+        self._watch_stop = threading.Event()
+        self._watch_thread = None
+        self._watch_poll = getattr(cfg, "WATCH_STREAM_POLL", 4)
         # 审批中继：daemon 内线程，构造即备好，run() 时 start()。
         # 延迟导入避免纯路由测试硬依赖；缺失时降级为无中继（callback 只静默 answer）。
         self._relay = None
@@ -296,6 +303,7 @@ class Daemon:
 
     def shutdown(self, join_timeout=3.0):
         self._stop = True
+        self._watch_stop.set()                 # 旁听线程随停
         if self._relay is not None:
             self._relay.shutdown(join_timeout=join_timeout)
         # 释放一个 slot 确保 dispatcher 能越过 acquire 拿到哨兵；再投哨兵
@@ -469,7 +477,8 @@ class Daemon:
     def _handle_callback(self, cq):
         data = cq.get("data") or ""
         # 面板选择回调（daemon 自管）：白名单闸在前（S1），再路由
-        if data.startswith(("sess:", "tsel:", "mdl:", "sesspg:", "taskpg:", "force:")):
+        if data.startswith(("sess:", "tsel:", "mdl:", "sesspg:", "taskpg:", "force:",
+                            "wsel:", "wselpg:")):
             frm = cq.get("from") or {}
             if frm.get("id") not in self.cfg.ALLOWED_USER_IDS:
                 log.info("丢弃非白名单 picker callback from.id=%s", frm.get("id"))
@@ -485,6 +494,11 @@ class Daemon:
             elif data.startswith("taskpg:"):
                 self._send_tasks_panel(chat_id, page=self._pg(data), edit_mid=mid)
                 self.api.answer_callback_query(cq.get("id"))
+            elif data.startswith("wselpg:"):
+                self._send_watch_panel(chat_id, page=self._pg(data), edit_mid=mid)
+                self.api.answer_callback_query(cq.get("id"))
+            elif data.startswith("wsel:"):
+                self._cb_toggle_watch(chat_id, data[len("wsel:"):], cq.get("id"), mid)
             elif data.startswith("sess:"):
                 self._cb_pick_session(chat_id, data[len("sess:"):], cq.get("id"), mid)
             elif data.startswith("tsel:"):
@@ -641,12 +655,14 @@ class Daemon:
         return matches[0] if len(matches) == 1 else None
 
     def _cmd_watch(self, chat_id, text):
-        """/watch <编号|sid>：把会话并入观察集，其工具审批也推手机。"""
+        """/watch [编号|sid]：把会话并入观察集——其审批 + 正文都推手机。
+
+        无参 → 弹会话面板点选（出门在外记不住编号）；有参保留快捷路径：
+        编号 → 查台账取 sid；否则按 sid 前缀在会话目录里唯一匹配。
+        """
         parts = text.split()
         if len(parts) < 2:
-            self._send(chat_id,
-                       "用法：/watch <任务编号|会话ID>\n"
-                       "把电脑上开的会话加入观察，其危险工具审批也会推到手机。")
+            self._send_watch_panel(chat_id, page=0)
             return
         sid = self._resolve_sid(parts[1])
         if not sid:
@@ -677,15 +693,147 @@ class Daemon:
                 self._save_watched()
         self._send(chat_id, "已取消观察。" if removed else "该会话不在观察集内。")
 
+    def _send_watch_panel(self, chat_id, page=0, edit_mid=None):
+        """/watch 无参面板：列最近会话，点按切换观察（👁=已观察，再点取消）。"""
+        sessions = self._scan_sessions(limit=_SESSION_SCAN_CAP)
+        if not sessions:
+            self._send(chat_id, "本工作区暂无 Claude Code 会话记录。")
+            return
+        watched = self.watched_set()
+        rows, text = self._paginate(
+            sessions, page,
+            "选择要观察的会话（点按切换：👁=审批与正文已推手机，再点取消）",
+            btn=lambda s: {
+                "text": f"{'👁 ' if s['full'] in watched else ''}"
+                        f"{self._fmt_mtime(s['mtime'])} · {s['summary'][:26]}",
+                "callback_data": f"wsel:{s['full']}"},
+            nav_prefix="wselpg")
+        if edit_mid is not None:
+            self.api.edit_message(chat_id, edit_mid, text,
+                                  reply_markup={"inline_keyboard": rows})
+        else:
+            self._send(chat_id, text, reply_markup={"inline_keyboard": rows})
+
+    def _cb_toggle_watch(self, chat_id, sid, cq_id, mid=None):
+        """面板点选：观察↔取消切换；就地刷新面板保留按钮（可连续多选）。"""
+        with self._watched_lock:
+            if sid in self._watched:
+                self._watched.discard(sid)
+                toast = "已取消观察"
+            else:
+                self._watched.add(sid)
+                toast = "👁 已观察，其审批与正文将推到手机"
+            self._save_watched()
+        # 就地刷新标记，不折叠面板——常见场景是连续勾选多个
+        self._send_watch_panel(chat_id, page=0, edit_mid=mid)
+        self.api.answer_callback_query(cq_id, text=toast)
+
+    # ── 旁听流：被 watch 会话的正文实时推手机（审批之外的另一半语义）─────────
+    def _watch_tick(self):
+        """尾随每个被观察会话的 transcript 增量，推送新增 assistant 正文。
+
+        · 只推 text 部件；thinking / tool_use（含 Bash 输出）全部跳过。
+        · 有活跃任务的会话跳过——其正文已由进度卡负责，防双推。
+        · 新观察的 sid 从"当前末尾"起算，不回放历史；只消费完整行，半行留下轮。
+        · 二进制读 + 字节偏移，杜绝多字节字符在 seek 边界上错位。
+        """
+        watched = self.watched_set()
+        # 清理已取消观察的偏移量，防字典无限增长
+        for sid in list(self._watch_offsets):
+            if sid not in watched:
+                self._watch_offsets.pop(sid, None)
+        if not watched:
+            return
+        active = self.store.active_session_ids()
+        for sid in watched:
+            if sid in active:
+                continue
+            path = self._session_path(sid)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            off = self._watch_offsets.get(sid)
+            if off is None or size < off:      # 新观察 / 文件异常变小 → 重新锚定末尾
+                self._watch_offsets[sid] = size
+                continue
+            if size == off:
+                continue
+            try:
+                with open(path, "rb") as f:
+                    f.seek(off)
+                    data = f.read(size - off)
+            except OSError:
+                continue
+            end = data.rfind(b"\n")
+            if end < 0:                        # 只有半行：等写完整再消费
+                continue
+            consumed = data[:end + 1]
+            self._watch_offsets[sid] = off + len(consumed)
+            texts = []
+            for raw in consumed.split(b"\n"):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8", errors="replace"))
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                    continue
+                for part in (obj.get("message") or {}).get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        t = (part.get("text") or "").strip()
+                        if t:
+                            texts.append(t)
+            if texts:
+                title = config._esc(self._session_title(path)[:40])
+                body = config.md_to_html("\n\n".join(texts))
+                self._send(self.cfg.CHAT_ID, f"👁 <b>{title}</b>\n{body}")
+
+    def _watch_loop(self):
+        while not self._watch_stop.is_set():
+            try:
+                self._watch_tick()
+            except Exception as e:   # noqa: BLE001 — 单轮异常不得杀死旁听线程
+                log.warning("旁听流异常: %s", config.redact(repr(e)))
+            self._watch_stop.wait(self._watch_poll)
+
+    def start_watch_stream(self):
+        if self._watch_thread is not None:
+            return
+        self._watch_thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self._watch_thread.start()
+
     def _set_current(self, chat_id, task_id):
         with self._current_lock:
             self._current[str(chat_id)] = task_id
-            try:
-                os.makedirs(os.path.dirname(self._current_file), exist_ok=True)
-                with open(self._current_file, "w", encoding="utf-8") as f:
-                    json.dump(self._current, f)
-            except OSError as e:
-                log.warning("当前会话指针持久化失败: %s", config.redact(repr(e)))
+            self._persist_current()
+
+    def _persist_current(self):
+        # 调用方须已持 _current_lock
+        try:
+            os.makedirs(os.path.dirname(self._current_file), exist_ok=True)
+            with open(self._current_file, "w", encoding="utf-8") as f:
+                json.dump(self._current, f)
+        except OSError as e:
+            log.warning("当前会话指针持久化失败: %s", config.redact(repr(e)))
+
+    def _cmd_detach(self, chat_id):
+        """/detach：松开「当前会话」指针回到待机——之后普通消息=自动开全新轻会话。
+
+        不动任何任务/会话本体，只清指针；随时可 /resume、/sessions 再挂回去。
+        """
+        with self._current_lock:
+            had = self._current.pop(str(chat_id), None)
+            if had is not None:
+                self._persist_current()
+        if had is not None:
+            self._send(chat_id,
+                       "💤 已脱离当前会话，进入待机。\n"
+                       "现在发消息=开一个全新对话；回存量会话用 /resume 或 /sessions。")
+        else:
+            self._send(chat_id, "当前本就无会话（待机中）。发消息即开新对话。")
 
     def _pc_busy(self, chat_id, sid):
         """PC 端正持有该会话（心跳 TTL 内）→ 提示并拒接手，返回 True 表示已拦截。
@@ -764,6 +912,8 @@ class Daemon:
             self._cmd_rename(chat_id, text)
         elif cmd == "/current":
             self._cmd_current(chat_id)
+        elif cmd == "/detach":
+            self._cmd_detach(chat_id)
         elif cmd == "/watch":
             self._cmd_watch(chat_id, text)
         elif cmd == "/unwatch":
@@ -787,6 +937,7 @@ class Daemon:
             "· /resume — <b>弹面板</b>选一个任务<b>切为当前会话</b>，之后直接发消息续话\n"
             "· /sessions — <b>弹面板</b>选电脑上开的会话切为当前（免手打长 ID）\n"
             "· /current — 看<b>当前会话</b>是哪个 + 回电脑接管命令 + 最近上文\n"
+            "· /detach — <b>脱离</b>当前会话待机：之后发消息=开全新对话（不影响原会话）\n"
             "· /tasks — 列最近任务（编号/状态/短 sid）\n"
             "· /say &lt;编号&gt; &lt;文字&gt; — 给指定任务发一句并切为当前会话\n"
             "· /attach &lt;短ID&gt; — 文本方式接管电脑会话（同 /sessions）\n"
@@ -796,8 +947,8 @@ class Daemon:
             "· /rename &lt;编号&gt; &lt;新名&gt; — 重命名任务，列表更好认\n\n"
             "<b>审批</b>：危险工具会弹 ✅批准/❌拒绝/⚡全批 按钮；"
             "本机 agents-island 与手机哪边先点哪边算数。\n"
-            "· /watch &lt;编号|ID&gt; — 把电脑上开的会话加入观察，其审批也推手机；"
-            "/unwatch 取消\n"
+            "· /watch — <b>弹面板</b>选会话观察（👁 审批与正文都推手机，再点取消）；"
+            "也可 /watch &lt;编号|ID&gt;，/unwatch 全取消\n"
             "进度卡带 sid，回电脑可 <code>claude --resume &lt;sid&gt;</code> 接管。")
 
     def _cmd_new(self, chat_id, text, msg_id=None):
@@ -1361,6 +1512,7 @@ class Daemon:
         self.start_workers()
         if self._relay is not None:
             self._relay.start()                 # 审批中继线程
+        self.start_watch_stream()               # 旁听流：watch 会话正文推手机
         import time
         while not self._stop:
             offset = self._load_offset()

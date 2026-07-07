@@ -76,10 +76,11 @@ are checked before any routing.
 | `/attach <shortid>` | Same as `/sessions` but by id |
 | `/say <n> <text>` | Continue task `n` (or just reply to its card) |
 | `/current` | Show the current session + a copy-paste `claude --resume <id>` + its last turn |
+| `/detach` | Go idle: release the current-session pointer; next plain text starts a fresh chat |
 | `/model` | Set the default model for `/new` (inline panel) |
 | `/rename <n> <name>` | Rename a task |
 | `/tasks` | List recent tasks, each with a copy-paste `claude --resume <id>` |
-| `/watch <n\|id>` / `/unwatch` | Route a *local* session's approvals to your phone too (opt-in) |
+| `/watch` (panel) / `/watch <n\|id>` / `/unwatch` | Watch a *local* session: its approvals **and** assistant replies stream to your phone (thinking / tool output excluded). Tap to toggle |
 | `/extend <n> [hours]` | Extend a running task's hard timeout (default +2h, cap 12h) |
 | `/cancel <n>` | Kill a task's process group |
 | `/help` | Usage |
